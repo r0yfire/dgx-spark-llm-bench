@@ -1,0 +1,14 @@
+# Never commit secrets or local state
+.api_key
+.active
+.env
+*.token
+
+# Large / generated
+models/
+venv/
+cybench/
+results/
+logs/
+*.gguf
+*.safetensors
