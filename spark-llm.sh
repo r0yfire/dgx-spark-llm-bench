@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
-# spark-llm.sh - install, run, benchmark and clean up two abliterated models on an NVIDIA DGX Spark.
+# spark-llm.sh - install, run, benchmark and clean up open-weight models on an NVIDIA DGX Spark.
 #
-#   1) Qwen3.8-27B-Uncensored-NVFP4   (orcarouter)        -> vLLM, Spark build (AEON image)
-#   2) CyberTiel 35B-A3B (Q4_K_XL / Q8_K_XL, MTP GGUF)    -> llama.cpp server (CUDA 13, arm64)
-#
-# Only one model runs at a time; both expose an OpenAI-compatible API on :8000 (bearer key required).
+# Models (see `--list`) run on one of four engines, one model at a time, behind an OpenAI-compatible API on :8000
+# (bearer key required). Each engine reads its own format of the same weights:
+#   vllm        vLLM, Spark build (AEON image)               NVFP4 checkpoints
+#   llamacpp    llama.cpp server (CUDA 13, arm64)            GGUF
+#   polystrata  PolyStrata (r0yfire fork, built for GB10)     GGUF MoE models, natively (no Docker)
+#   tensorfold  TensorFold native release (CUDA, sm_121)     MLX 4-bit checkpoints + DFlash2 drafter, natively
 # Interactive menu by default. Flags for scripting:
-#   --install qwen|cybertiel|cybertiel-q8   download weights + pull image
-#   --start   qwen|cybertiel|cybertiel-q8   (re)start that model
+#   --list                                    models and the engines each one runs on
+#   --install MODEL [--engine E]              download weights + the engine (image, or the PolyStrata build)
+#   --start   MODEL [--engine E]              (re)start that model; E defaults to the model's first engine
 #   --stop | --status
-#   --cybench-setup                          clone + patch Cybench, pull its image
-#   --cybench-run [N]                        Cybench (unguided, 15 iterations) on the running model
-#   --cybench-summary <results-dir>          per-task table for a finished run
+#   --speed [cases]                           tokens/s of the running model (prefill + decode), see speedtest.py
+#   --parity                                  greedy answers to fixed prompts, to compare two engines on one model
+#   --cybench-setup                           clone + patch Cybench, pull its image
+#   --cybench-run [N]                         Cybench (unguided, 15 iterations) on the running model
+#   --cybench-summary <results-dir>           per-task table for a finished run
 #   --cleanup [stop|containers|weights|all]
 #   --yes (no confirmations) | --dry-run (print, change nothing) | -h
-# Hugging Face auth (needed for the gated Qwen repo): export HF_TOKEN=... or run `hf auth login` once.
+# Hugging Face auth (needed for gated repos): export HF_TOKEN=... or run `hf auth login` once.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${SPARK_LLM_HOME:-$HOME/spark-llm}"
 PORT="${PORT:-8000}"
 VLLM_IMAGE="${VLLM_IMAGE:-ghcr.io/aeon-7/aeon-vllm-ultimate:latest}"
@@ -29,11 +35,32 @@ CYBENCH_MAX_OUT="${CYBENCH_MAX_OUT:-32768}"
 CYBENCH_TASK_TIMEOUT="${CYBENCH_TASK_TIMEOUT:-21600}"  # seconds per task: a safety net only; the real budget is CYBENCH_ITER iterations
 CYBENCH_ONLY="${CYBENCH_ONLY:-}"                        # optional comma-separated task numbers to run, e.g. "6,7,9,10"
 VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.70}"                  # unified memory: stay <= 0.8
+# MTP with 4 draft tokens: measured on the Spark against 2 and 6 (Qwen3.8-27B NVFP4: +10% decode over 2, 6 no better)
+VLLM_SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":4}'
+VLLM_SPEC="${VLLM_SPEC:-$VLLM_SPEC_DEFAULT}"            # speculative decoding for vLLM models (JSON for --speculative-config)
 CTX="${CTX:-262144}"
-QWEN_REPO="orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
-TIEL_REPO="peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP"
+# PolyStrata: the r0yfire fork (upstream simplexai-labs/PolyStrata + the aarch64 build fix), pinned.
+PS_REPO="${PS_REPO:-https://github.com/r0yfire/PolyStrata.git}"
+PS_REF="${PS_REF:-34e454bbefe03ddd0cd449bce85c1fd2f8ba4029}"
+PS_DIR="$BASE/polystrata"; PS_DATA="$BASE/polystrata-data"; PS_PID="$BASE/.polystrata.pid"
 KEYFILE="$BASE/.api_key"; ACTIVE="$BASE/.active"
 YES=0; DRY=0
+
+# Model registry, one row per (model, engine): each engine reads its own format of the same weights.
+#   key|engine|title|HF repo|--include pattern ("," separates several)|folder under models/|served name
+# A model's first row is its default engine: the fastest one measured on the Spark (README, "Results").
+MODELS=(
+ "qwen27b-abl|tensorfold|Qwen3.8-27B Uncensored, MLX 4-bit + DFlash2|orcarouter/Qwen3.8-27B-Uncensored-MLX|4-bit/*|qwen27b-abl-mlx|Qwen3.8-27B-Uncensored"
+ "qwen27b-abl|vllm|Qwen3.8-27B Uncensored, NVFP4 + MTP|orcarouter/Qwen3.8-27B-Uncensored-NVFP4||qwen-nvfp4|Qwen3.8-27B-Uncensored"
+ "cybertiel|polystrata|CyberTiel 35B-A3B UD-Q4_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q4_K_XL.gguf|cybertiel-q4|CyberTiel"
+ "cybertiel|llamacpp|CyberTiel 35B-A3B UD-Q4_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q4_K_XL.gguf|cybertiel-q4|CyberTiel"
+ "cybertiel-q8|polystrata|CyberTiel 35B-A3B UD-Q8_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q8_K_XL.gguf|cybertiel-q8|CyberTiel"
+ "cybertiel-q8|llamacpp|CyberTiel 35B-A3B UD-Q8_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q8_K_XL.gguf|cybertiel-q8|CyberTiel"
+)
+# DFlash2 drafter for the Qwen3.8-27B family (TensorFold drafts with it; vLLM can too via VLLM_SPEC)
+DRAFTER_27B_REPO="${DRAFTER_27B_REPO:-z-lab/Qwen3.8-27B-DFlash2}"
+# TensorFold: native release (CUDA kernels embedded), pinned and checked against its published SHA-256
+TF_VERSION="${TF_VERSION:-1.3.6}"; TF_DIR="$BASE/tensorfold"; TF_PID="$BASE/.tensorfold.pid"
 
 # Fixed Cybench subset: 10 tasks from the official task_list.txt that run on the aarch64 Spark. Excluded: tasks shipping x86-64
 # binaries/services (no amd64 emulation / x86 disassembler) and tasks whose Docker build fails on archived Debian repos (apt 404).
@@ -62,12 +89,26 @@ api_key(){
   cat "$KEYFILE"
 }
 
-norm(){ case "${1:-}" in
-  qwen) echo qwen;; cybertiel|tiel|cybertiel-q4) echo cybertiel;; cybertiel-q8|tiel-q8) echo cybertiel-q8;;
-  *) die "unknown model '${1:-}' (qwen | cybertiel | cybertiel-q8)";; esac; }
-cname(){ case "$1" in qwen) echo llm-qwen;; *) echo llm-cybertiel;; esac; }
-mdir(){ case "$1" in qwen) echo "$BASE/models/qwen-nvfp4";; cybertiel) echo "$BASE/models/cybertiel-q4";; cybertiel-q8) echo "$BASE/models/cybertiel-q8";; esac; }
-served(){ case "$1" in qwen) echo Qwen3.8-27B-Uncensored;; *) echo CyberTiel;; esac; }
+# ---------------------------------------------------------------- registry
+model_rows(){ local r; for r in "${MODELS[@]}"; do [ "${r%%|*}" = "$1" ] && echo "$r"; done; return 0; }
+engines_of(){ model_rows "$1" | cut -d'|' -f2 | paste -sd' ' -; }
+field(){   # $1 model, $2 engine, $3 column: 3 title, 4 repo, 5 include, 6 folder, 7 served name
+  model_rows "$1" | awk -F'|' -v e="$2" -v n="$3" '$2 == e { print $n; exit }'; }
+norm(){ local m="${1:-}"
+  case "$m" in qwen) m=qwen27b-abl;; tiel|cybertiel-q4) m=cybertiel;; tiel-q8) m=cybertiel-q8;; esac
+  [ -n "$(model_rows "$m")" ] || die "unknown model '$m' (see --list)"; echo "$m"; }
+engine_for(){   # $1 model, $2 requested engine (may be empty): the engine, checked against the registry
+  local engines; engines=$(engines_of "$1")
+  [ -z "${2:-}" ] && { echo "${engines%% *}"; return; }
+  [[ " $engines " == *" $2 "* ]] || die "$1 does not run on '$2' (it runs on: $engines)"
+  echo "$2"
+}
+mdir(){ echo "$BASE/models/$(field "$1" "$2" 6)"; }       # $1 model, $2 engine
+served(){ field "$1" "$2" 7; }
+list_models(){
+  printf '  %-14s %-11s %s\n' MODEL ENGINE "TITLE   (first engine of a model = its default)"
+  local r k e t; for r in "${MODELS[@]}"; do IFS='|' read -r k e t _ <<<"$r"; printf '  %-14s %-11s %s\n' "$k" "$e" "$t"; done
+}
 
 hf_cli(){
   need python3
@@ -81,85 +122,242 @@ hf_cli(){
 preflight(){
   need docker
   docker info >/dev/null 2>&1 || die "cannot talk to Docker (is $USER in the docker group?)"
-  mkdir -p "$BASE/models" "$BASE/logs" "$BASE/results"
+  mkdir -p "$BASE/models" "$BASE/logs" "$BASE/results" "$BASE/speed"
   local free; free=$(df -BG --output=avail "$BASE" | tail -1 | tr -dc 0-9)
   [ "$free" -ge 80 ] || die "need ~80 GB free in $BASE (have ${free} GB)"
 }
 
-install_model(){
-  local m; m=$(norm "$1"); preflight; hf_cli
-  case "$m" in
-    qwen)
-      [ -n "${HF_TOKEN:-}" ] || [ -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ] || \
-        say "Note: $QWEN_REPO is gated. Request access on Hugging Face, then export HF_TOKEN or run 'hf auth login'."
-      say "Downloading $QWEN_REPO (~23 GB)"
-      run "$BASE/venv/bin/hf" download "$QWEN_REPO" --local-dir "$(mdir qwen)"
-      run docker pull "$VLLM_IMAGE" ;;
-    cybertiel|cybertiel-q8)
-      local q=Q4_K_XL; [ "$m" = cybertiel-q8 ] && q=Q8_K_XL
-      say "Downloading CyberTiel $q"
-      run "$BASE/venv/bin/hf" download "$TIEL_REPO" --include "*UD-${q}.gguf" --local-dir "$(mdir "$m")"
-      run docker pull "$LLAMA_IMAGE" ;;
-  esac
-  say "Installed $m"
+download(){   # $1 model, $2 engine
+  local repo inc p; repo=$(field "$1" "$2" 4); inc=$(field "$1" "$2" 5)
+  [ -n "${HF_TOKEN:-}" ] || [ -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ] || \
+    say "Note: some repos are gated. Request access on Hugging Face, then export HF_TOKEN or run 'hf auth login'."
+  say "Downloading $repo${inc:+ ($inc)}"
+  # one --include per pattern: `hf download` reads a second pattern after one flag as a file name
+  local args=(); IFS=',' read -ra pats <<<"$inc"; for p in "${pats[@]}"; do [ -n "$p" ] && args+=(--include "$p"); done
+  run "$BASE/venv/bin/hf" download "$repo" "${args[@]}" --local-dir "$(mdir "$1" "$2")"
 }
 
-wait_ready(){   # $1 container
+drafter_27b(){ echo "$BASE/models/qwen27b-dflash2"; }
+needs_drafter(){ [[ "$1" == qwen27b* ]] && { [ "$2" = tensorfold ] || [[ "$2" = vllm && "$VLLM_SPEC" == *dflash* ]]; }; }
+
+install_model(){   # $1 model, $2 engine (optional)
+  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight; hf_cli
+  download "$m" "$e"
+  if needs_drafter "$m" "$e"; then
+    say "Downloading the DFlash2 drafter ($DRAFTER_27B_REPO)"
+    run "$BASE/venv/bin/hf" download "$DRAFTER_27B_REPO" --local-dir "$(drafter_27b)"
+  fi
+  case "$e" in
+    vllm) run docker pull "$VLLM_IMAGE" ;;
+    llamacpp) run docker pull "$LLAMA_IMAGE" ;;
+    polystrata) ps_install ;;
+    tensorfold) tf_install ;;
+  esac
+  say "Installed $m ($e)"
+}
+
+# ---------------------------------------------------------------- PolyStrata (native, not Docker)
+# strata-poly has no aarch64 release package, so it is built here for the GB10 (sm_121) from the pinned fork.
+ps_install(){
+  need git; need cmake; need python3
+  local nvcc=/usr/local/cuda/bin/nvcc; [ -x "$nvcc" ] || nvcc=$(command -v nvcc) || die "the CUDA 13 toolkit (nvcc) is needed"
+  if [ ! -d "$PS_DIR/.git" ]; then say "Cloning PolyStrata ($PS_REPO)"; run git clone -q "$PS_REPO" "$PS_DIR"; fi
+  run git -C "$PS_DIR" fetch -q origin "$PS_REF" 2>/dev/null || true
+  run git -C "$PS_DIR" checkout -q "$PS_REF"
+  if [ ! -x "$PS_DIR/terminal/.venv/bin/python" ]; then
+    say "Creating PolyStrata's Python environment"
+    run python3 -m venv "$PS_DIR/terminal/.venv"
+  fi
+  run "$PS_DIR/terminal/.venv/bin/pip" install -q --disable-pip-version-check -r "$PS_DIR/terminal/requirements.txt" ninja
+  [ "$DRY" = 1 ] && return
+  local stamp="$PS_DIR/build-poly-spark/.built-from"
+  if [ -x "$PS_DIR/build-poly-spark/strata-poly" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$PS_REF" ]; then
+    say "strata-poly already built from $PS_REF"; return; fi
+  say "Building strata-poly for sm_121 (about 10 minutes)"
+  ( cd "$PS_DIR" && PATH="$PS_DIR/terminal/.venv/bin:$(dirname "$nvcc"):$PATH" &&
+    cmake -G Ninja -S engine -B build-poly-spark -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF \
+      -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=OFF \
+      "-DCMAKE_CUDA_ARCHITECTURES=121-real;121-virtual" "-DCMAKE_CUDA_COMPILER=$nvcc" >"$BASE/logs/polystrata-build.log" 2>&1 &&
+    # CUDA 13.0's ptxas now and then fails on a PTX file it just wrote; a second pass gets past it (PolyStrata issue #45)
+    { cmake --build build-poly-spark --target strata-poly -j 16 >>"$BASE/logs/polystrata-build.log" 2>&1 ||
+      cmake --build build-poly-spark --target strata-poly -j 16 >>"$BASE/logs/polystrata-build.log" 2>&1; } ) ||
+    die "strata-poly build failed: see $BASE/logs/polystrata-build.log"
+  echo "$PS_REF" > "$stamp"
+}
+
+ps_config(){   # $1 model -> prints ONLY the path of its PolyStrata run config (tokenizer pack + JSON); messages go to stderr
+  local m=$1 g pack cfg; g=$(find "$(mdir "$m" polystrata)" -name '*.gguf' | sort | head -1)
+  [ -n "$g" ] || die "no GGUF under $(mdir "$m" polystrata)"
+  pack="$PS_DATA/packs/$m"; cfg="$PS_DATA/strata-$m.json"; mkdir -p "$pack"
+  if [ ! -s "$pack/tokenizer/vocab.json" ]; then
+    say "Exporting $m's tokenizer for PolyStrata" >&2
+    ( cd "$PS_DIR/terminal" && PYTHONPATH=../engine/third_party/strata-gguf-py \
+      .venv/bin/python tools/strata_tokenizer.py --gguf "$g" --out "$pack" >/dev/null ) || die "tokenizer export failed"
+  fi
+  python3 - "$cfg" "$PS_DIR" "$g" "$pack" "$CTX" "$(served "$m" polystrata)" "$BASE/logs/polystrata-$m.log" <<'PY'
+import json, sys
+cfg, ps, gguf, pack, ctx, name, log = sys.argv[1:]
+json.dump({"exe": f"{ps}/build-poly-spark/strata-poly",
+           "args": ["--model", gguf, "--max-context", ctx, "--expert-profile", f"{pack}/expert-profile.txt",
+                    "--prompt-batch", "2048"],
+           "cwd": f"{ps}/terminal", "tokenizer": f"{pack}/tokenizer", "model_name": name, "log": log},
+          open(cfg, "w"), indent=1)
+PY
+  echo "$cfg"
+}
+
+ps_start(){   # $1 model
+  local m=$1 cfg; [ -x "$PS_DIR/build-poly-spark/strata-poly" ] || die "PolyStrata is not installed (run --install $m --engine polystrata)"
+  [ "$DRY" = 1 ] && { say "(dry run: would start PolyStrata for $m)"; return; }
+  cfg=$(ps_config "$m")
+  say "Starting $(field "$m" polystrata 3) on PolyStrata (strata-poly, ${CTX} ctx)"
+  # the key goes in through the environment (STRATA_API_KEY), not argv, so `ps` does not show it
+  ( cd "$PS_DIR/terminal" && export STRATA_API_KEY; STRATA_API_KEY="$(api_key)" &&
+    native_launch "$PS_PID" "$BASE/logs/polystrata-server.log" \
+      .venv/bin/python serve/server.py --engine strata --config "$cfg" --host 0.0.0.0 --port "$PORT" )
+}
+
+# ---------------------------------------------------------------- native engines (PolyStrata, TensorFold)
+# A native server runs in its own session, so --stop can end it and every process it spawned together.
+# The PID file holds the session leader's PID, which `exec` makes the server itself (not a wrapper shell).
+native_launch(){   # $1 pid file, $2 log, $3.. command
+  local pidf=$1 log=$2; shift 2
+  setsid bash -c 'echo $$ > "$0"; exec "$@"' "$pidf" "$@" >"$log" 2>&1 </dev/null &
+  for _ in 1 2 3 4 5; do [ -s "$pidf" ] && break; sleep 1; done
+}
+
+native_stop(){   # $1 pid file, $2 label
+  [ -s "$1" ] || return 0
+  local pid; pid=$(cat "$1")
+  if kill -0 "$pid" 2>/dev/null || pgrep -s "$pid" >/dev/null; then
+    say "Stopping $2"; run kill -TERM -- "-$pid" 2>/dev/null || run kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 60); do kill -0 "$pid" 2>/dev/null || pgrep -s "$pid" >/dev/null || break; sleep 1; done
+    if pgrep -s "$pid" >/dev/null; then run kill -KILL -- "-$pid" 2>/dev/null || true; fi
+  fi
+  [ "$DRY" = 1 ] || rm -f "$1"
+}
+
+native_alive(){ [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+
+tf_bin(){ echo "$TF_DIR/tensorfold-$TF_VERSION-linux-aarch64/bin/tensorfold-native"; }
+
+tf_install(){
+  [ -x "$(tf_bin)" ] && { say "TensorFold $TF_VERSION already installed"; return; }
+  need curl; need sha256sum
+  local a="tensorfold-$TF_VERSION-linux-aarch64.tar.gz" u="https://github.com/ashhart/TensorFold/releases/download/v$TF_VERSION"
+  say "Installing TensorFold $TF_VERSION (native, CUDA kernels embedded)"
+  run mkdir -p "$TF_DIR"
+  ( cd "$TF_DIR" && run curl -fsSLO "$u/$a" && run curl -fsSLO "$u/$a.sha256" &&
+    { [ "$DRY" = 1 ] || sha256sum -c "$a.sha256"; } && run tar -xzf "$a" ) || die "TensorFold download or checksum failed"
+}
+
+tf_start(){   # $1 model
+  local m=$1 dir inc path drafter=()
+  [ -x "$(tf_bin)" ] || die "TensorFold is not installed (run --install $m --engine tensorfold)"
+  dir=$(mdir "$m" tensorfold); inc=$(field "$m" tensorfold 5); path=$dir
+  [[ "$inc" == */* ]] && path="$dir/${inc%%/*}"          # a pattern like "4-bit/*" means the model is that subfolder
+  if needs_drafter "$m" tensorfold; then drafter=(--drafter "$(drafter_27b)"); fi
+  [ "$DRY" = 1 ] && { say "(dry run: would serve $path on TensorFold)"; return; }
+  say "Starting $(field "$m" tensorfold 3) on TensorFold $TF_VERSION (${CTX} ctx)"
+  native_launch "$TF_PID" "$BASE/logs/tensorfold-$m.log" "$(tf_bin)" serve "$path" "${drafter[@]}" \
+    --context "$CTX" --parallel 1 --host 0.0.0.0 --port "$PORT" --api-key-file "$KEYFILE" \
+    --name "$(served "$m" tensorfold)" --no-update-check ${TF_EXTRA:-}
+}
+
+# ---------------------------------------------------------------- start / stop
+wait_ready(){   # $1 engine, $2 model, $3 container (docker engines)
   local key; key=$(api_key); local t=0
   say "Waiting for the server (first start can take 10+ minutes: weights load, kernels compile)"
   while [ $t -lt 1800 ]; do
-    docker ps --format '{{.Names}}' | grep -qx "$1" || { docker logs --tail 60 "$1" 2>&1 || true; die "container $1 exited"; }
+    case "$1" in
+      polystrata) native_alive "$PS_PID" || { tail -40 "$BASE/logs/polystrata-server.log"; die "PolyStrata exited"; } ;;
+      tensorfold) native_alive "$TF_PID" || { tail -40 "$BASE/logs/tensorfold-$2.log"; die "TensorFold exited"; } ;;
+      *) docker ps --format '{{.Names}}' | grep -qx "$3" || { docker logs --tail 60 "$3" 2>&1 || true; die "container $3 exited"; } ;;
+    esac
     if curl -fs -H "Authorization: Bearer $key" "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
-      say "Ready: http://$(hostname -I | awk '{print $1}'):$PORT/v1  (model: $(served "${2}"))"; return 0; fi
+      say "Ready: http://$(hostname -I | awk '{print $1}'):$PORT/v1  (model: $(served "$2" "$1"), engine: $1)"; return 0; fi
     sleep 10; t=$((t+10))
   done
-  docker logs --tail 80 "$1" 2>&1 || true; die "timed out waiting for $1"
+  die "timed out waiting for $2 on $1"
 }
 
 stop_all(){
-  for c in llm-qwen llm-cybertiel; do
-    docker ps -a --format '{{.Names}}' | grep -qx "$c" && { say "Stopping $c"; run docker rm -f "$c" >/dev/null; } || true
-  done
+  local c; for c in $(docker ps -a --format '{{.Names}}' | grep -E '^llm-' || true); do say "Stopping $c"; run docker rm -f "$c" >/dev/null; done
+  native_stop "$PS_PID" PolyStrata
+  native_stop "$TF_PID" TensorFold
   [ "$DRY" = 1 ] || rm -f "$ACTIVE"
+  # the port must be free before the next start: a server still holding it would answer in the new one's place
+  local t=0; while [ "$DRY" = 0 ] && ss -ltn "( sport = :$PORT )" | grep -q LISTEN; do
+    [ $t -ge 60 ] && die "port $PORT is still in use after stopping everything (ss -ltnp to see by what)"; sleep 1; t=$((t+1)); done
 }
 
-start_model(){
-  local m; m=$(norm "$1"); preflight
-  [ -d "$(mdir "$m")" ] || die "$m is not installed (run --install $m)"
+start_model(){   # $1 model, $2 engine (optional)
+  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight
+  [ -d "$(mdir "$m" "$e")" ] || [ "$DRY" = 1 ] || die "$m is not installed for $e (run --install $m --engine $e)"
   stop_all
-  local key; key=$(api_key); local name; name=$(cname "$m")
-  if [ "$m" = qwen ]; then
-    say "Starting Qwen3.8-27B-Uncensored-NVFP4 on vLLM (MTP, ${CTX} ctx, gpu-util $VLLM_GPU_UTIL)"
-    run docker run -d --name "$name" --gpus all --ipc=host -p "$PORT:8000" \
-      -e TORCH_CUDA_ARCH_LIST=12.1a -e CUTE_DSL_ARCH=sm_121a \
-      -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ENABLE_CUDA_COMPATIBILITY=0 \
-      -v "$(mdir qwen):/model:ro" --entrypoint vllm "$VLLM_IMAGE" \
-      serve /model --served-model-name "$(served qwen)" \
-      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
-      --gpu-memory-utilization "$VLLM_GPU_UTIL" --max-model-len "$CTX" --max-num-seqs 4 \
-      --trust-remote-code --reasoning-parser qwen3 \
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-      --host 0.0.0.0 --port 8000 --api-key "$key" ${QWEN_EXTRA:-}
-  else
-    local f; f=$(find "$(mdir "$m")" -name '*.gguf' | head -1); [ -n "$f" ] || [ "$DRY" = 1 ] || die "no GGUF under $(mdir "$m")"
-    say "Starting CyberTiel ($(basename "${f:-gguf}")) on llama.cpp (MTP, ${CTX} ctx)"
-    run docker run -d --name "$name" --gpus all -p "$PORT:8000" \
-      --health-cmd "curl -fs http://localhost:8000/health || exit 1" --health-interval 30s --health-start-period 10m \
-      -v "$(mdir "$m"):/models:ro" "$LLAMA_IMAGE" \
-      -m "/models/${f#"$(mdir "$m")"/}" --alias "$(served "$m")" -ngl 99 --jinja -fa on \
-      --ctx-size "$CTX" -np 1 --spec-type draft-mtp \
-      --temp 0.6 --top-p 0.95 --top-k 40 --min-p 0.05 \
-      --host 0.0.0.0 --port 8000 --api-key "$key" ${TIEL_EXTRA:-}
-  fi
-  [ "$DRY" = 1 ] || { echo "$m" > "$ACTIVE"; wait_ready "$name" "$m"; }
+  local key; key=$(api_key); local name="llm-$m"
+  case "$e" in
+    vllm)
+      local drafter=() spec="$VLLM_SPEC"
+      if [[ "$spec" == *dflash* ]]; then drafter=(-v "$(drafter_27b):/drafter:ro"); fi
+      say "Starting $(field "$m" vllm 3) on vLLM (speculative: $spec, ${CTX} ctx, gpu-util $VLLM_GPU_UTIL)"
+      run docker run -d --name "$name" --gpus all --ipc=host -p "$PORT:8000" \
+        -e TORCH_CUDA_ARCH_LIST=12.1a -e CUTE_DSL_ARCH=sm_121a \
+        -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ENABLE_CUDA_COMPATIBILITY=0 \
+        -v "$(mdir "$m" vllm):/model:ro" "${drafter[@]}" --entrypoint vllm "$VLLM_IMAGE" \
+        serve /model --served-model-name "$(served "$m" vllm)" \
+        --speculative-config "$spec" \
+        --gpu-memory-utilization "$VLLM_GPU_UTIL" --max-model-len "$CTX" --max-num-seqs 4 \
+        --trust-remote-code --reasoning-parser qwen3 \
+        --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+        --host 0.0.0.0 --port 8000 --api-key "$key" ${VLLM_EXTRA:-${QWEN_EXTRA:-}} ;;
+    llamacpp)
+      local d f; d=$(mdir "$m" llamacpp); f=$(find "$d" -name '*.gguf' | sort | head -1)
+      [ -n "$f" ] || [ "$DRY" = 1 ] || die "no GGUF under $d"
+      say "Starting $(field "$m" llamacpp 3) ($(basename "${f:-gguf}")) on llama.cpp (MTP, ${CTX} ctx)"
+      run docker run -d --name "$name" --gpus all -p "$PORT:8000" \
+        --health-cmd "curl -fs http://localhost:8000/health || exit 1" --health-interval 30s --health-start-period 10m \
+        -v "$d:/models:ro" "$LLAMA_IMAGE" \
+        -m "/models/${f#"$d"/}" --alias "$(served "$m" llamacpp)" -ngl 99 --jinja -fa on \
+        --ctx-size "$CTX" -np 1 --spec-type draft-mtp \
+        --temp 0.6 --top-p 0.95 --top-k 40 --min-p 0.05 \
+        --host 0.0.0.0 --port 8000 --api-key "$key" ${LLAMA_EXTRA:-${TIEL_EXTRA:-}} ;;
+    polystrata) ps_start "$m" ;;
+    tensorfold) tf_start "$m" ;;
+  esac
+  [ "$DRY" = 1 ] || { echo "$m $e" > "$ACTIVE"; wait_ready "$e" "$m" "$name"; }
 }
+
+active_model(){ cut -d' ' -f1 "$ACTIVE" 2>/dev/null; }
+active_engine(){ cut -d' ' -f2 "$ACTIVE" 2>/dev/null; }
 
 status(){
   say "Containers"; docker ps -a --filter name=llm- --format '  {{.Names}}  {{.Status}}  {{.Image}}'
-  say "Active model: $(cat "$ACTIVE" 2>/dev/null || echo none)"
+  local f n; for f in "$PS_PID:PolyStrata" "$TF_PID:TensorFold"; do n=${f#*:}; f=${f%%:*}
+    if native_alive "$f"; then say "$n: running (pid $(cat "$f"))"; else say "$n: not running"; fi; done
+  say "Active: $(cat "$ACTIVE" 2>/dev/null || echo none)"
   say "Memory"; free -g | sed -n 1,2p
-  say "Disk"; du -sh "$BASE/models"/* 2>/dev/null || echo "  no models installed"
+  say "Disk"; du -sh "$BASE/models"/* "$PS_DATA" 2>/dev/null || echo "  no models installed"
   echo "API key file: $KEYFILE"
+}
+
+# ---------------------------------------------------------------- speed
+speed(){   # $1 mode: speed | parity; $2 cases
+  local m e; m=$(active_model) || true; e=$(active_engine) || true
+  [ -n "$m" ] || die "no model is running (use --start)"
+  local label="$m-$e" out; out="$BASE/speed/$m-$e-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$BASE/speed"
+  local eb='{"chat_template_kwargs":{"enable_thinking":false}}'   # every engine writes answers, not reasoning, so they compare
+  local st="$SCRIPT_DIR/speedtest.py"; [ -f "$st" ] || die "speedtest.py is missing beside $0"
+  if [ "$1" = parity ]; then
+    python3 "$st" --base-url "http://127.0.0.1:$PORT/v1" --key-file "$KEYFILE" --label "$label" --parity --extra-body "$eb" --out "$out-parity.json"
+  else
+    python3 "$st" --base-url "http://127.0.0.1:$PORT/v1" --key-file "$KEYFILE" --label "$label" \
+      --cases "${2:-short,4k,16k,32k}" --runs "${SPEED_RUNS:-3}" --extra-body "$eb" --out "$out.json"
+    if [ "${SPEED_NEEDLE:-0}" -gt 0 ]; then
+      python3 "$st" --base-url "http://127.0.0.1:$PORT/v1" --key-file "$KEYFILE" --label "$label" \
+        --needle "$SPEED_NEEDLE" --extra-body "$eb" --out "$out-needle.json"; fi
+  fi
+  say "Results: $out*.json"
 }
 
 # ---------------------------------------------------------------- Cybench
@@ -221,11 +419,11 @@ write_env(){   # $1 = model key
   local extra
   # Not host.docker.internal: Cybench runs its own dockerd inside the agent container, whose docker0 (172.17.0.1) shadows host-gateway.
   local hostip; hostip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'); hostip=${hostip:-$(hostname -I | awk '{print $1}')}
-  if [ "$1" = qwen ]; then extra='{"top_k":20,"top_p":0.95}'; else extra='{"top_k":40,"min_p":0.05,"top_p":0.95}'; fi
+  case "$1" in qwen27b*) extra='{"top_k":20,"top_p":0.95}';; *) extra='{"top_k":40,"min_p":0.05,"top_p":0.95}';; esac
   ( umask 077; cat > "$CYBENCH_DIR/.env" <<EOF
 OPENAI_API_KEY=$key
 OPENAI_BASE_URL=http://$hostip:$PORT/v1
-CYBENCH_LOCAL_MODEL=$(served "$1")
+CYBENCH_LOCAL_MODEL=$(served "$1" "$(active_engine)")
 CYBENCH_TEMPERATURE=0.6
 CYBENCH_EXTRA_BODY=$extra
 EOF
@@ -235,12 +433,11 @@ EOF
 cybench_run(){
   local n="${1:-10}"
   [ -d "$CYBENCH_DIR/.git" ] || die "run --cybench-setup first"
-  local m; m=$(cat "$ACTIVE" 2>/dev/null) || die "no model is running (use --start)"
-  local mk; case "$m" in qwen) mk=qwen;; *) mk=cybertiel;; esac
-  write_env "$mk"
+  local m; m=$(active_model) || true; [ -n "$m" ] || die "no model is running (use --start)"
+  write_env "$m"
   local key; key=$(api_key)
   curl -fs -H "Authorization: Bearer $key" "http://127.0.0.1:$PORT/v1/models" >/dev/null || die "model server is not answering"
-  local out="$BASE/results/$m-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$out"
+  local out; out="$BASE/results/$m-$(active_engine)-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$out"
   say "Cybench: $m, first $n tasks, unguided, $CYBENCH_ITER iterations -> $out"
   cd "$CYBENCH_DIR"
   # Cybench appends every run to ./logs; move earlier runs aside so this run's summary only sees its own results.
@@ -305,7 +502,7 @@ cleanup(){
     echo "  1) stop      stop model servers"
     echo "  2) containers  stop + remove Docker images and Cybench containers"
     echo "  3) weights   containers + delete downloaded model weights"
-    echo "  4) all       everything under $BASE (weights, Cybench, results, venv, API key)"
+    echo "  4) all       everything under $BASE (weights, PolyStrata, Cybench, results, venv, API key)"
     read -r -p "Level [1-4]: " n; case "$n" in 1) level=stop;; 2) level=containers;; 3) level=weights;; 4) level=all;; *) return;; esac
   fi
   say "Current usage:"; du -sh "$BASE" "$BASE"/* 2>/dev/null | sed 's/^/  /' || true
@@ -316,7 +513,7 @@ cleanup(){
   run docker network rm shared_net >/dev/null 2>&1 || true
   for i in "$VLLM_IMAGE" "$LLAMA_IMAGE" "$CYBENCH_IMAGE"; do run docker rmi "$i" >/dev/null 2>&1 || true; done
   [ "$level" = containers ] && return
-  run rm -rf "$BASE/models"
+  run rm -rf "$BASE/models" "$PS_DATA"
   [ "$level" = weights ] && return
   run rm -rf "$BASE"
   say "Removed $BASE"
@@ -324,46 +521,43 @@ cleanup(){
 
 menu(){
   while true; do
+    echo; echo " DGX Spark model manager      [active: $(cat "$ACTIVE" 2>/dev/null || echo none)]"
+    local i=0 r k t e; for r in "${MODELS[@]}"; do i=$((i+1)); IFS='|' read -r k e t _ <<<"$r"; printf '  %2d) %-48s %s\n' "$i" "$t" "$e"; done
     cat <<EOF
-
- DGX Spark model manager      [active: $(cat "$ACTIVE" 2>/dev/null || echo none)]
-  1) Install + start Qwen3.8-27B-Uncensored-NVFP4   (vLLM)
-  2) Install + start CyberTiel 35B-A3B Q4_K_XL      (llama.cpp)
-  3) Install + start CyberTiel 35B-A3B Q8_K_XL      (llama.cpp)
-  4) Stop running model
-  5) Status
-  6) Set up Cybench
-  7) Run Cybench on the running model (10-task subset)
-  8) Clean up
-  q) Quit
+   s) Stop running model       t) Status          p) Speed test (tok/s)
+   c) Set up Cybench           r) Run Cybench on the running model (10-task subset)
+   x) Clean up                 q) Quit
 EOF
     read -r -p "> " c
     case "$c" in
-      1) install_model qwen && start_model qwen;;
-      2) install_model cybertiel && start_model cybertiel;;
-      3) install_model cybertiel-q8 && start_model cybertiel-q8;;
-      4) stop_all;; 5) status;; 6) cybench_setup;; 7) cybench_run 10;; 8) cleanup;;
+      [0-9]*) [ "$c" -ge 1 ] && [ "$c" -le "${#MODELS[@]}" ] || { echo "?"; continue; }
+              IFS='|' read -r k e _ <<<"${MODELS[$((c-1))]}"
+              install_model "$k" "$e" && start_model "$k" "$e";;
+      s) stop_all;; t) status;; p) speed speed;; c) cybench_setup;; r) cybench_run 10;; x) cleanup;;
       q|Q) exit 0;; *) echo "?";;
     esac
   done
 }
 
 # ---------------------------------------------------------------- args
-ACTION=""; ARG1=""; ARG2=""
+ACTION=""; ARG1=""; ENGINE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y) YES=1;; --dry-run) DRY=1;;
-    --install|--start|--cybench-run|--cleanup|--cybench-summary) ACTION="$1"; if [ $# -gt 1 ] && [[ "$2" != --* ]]; then ARG1="$2"; shift; fi;;
-    --stop|--status|--cybench-setup) ACTION="$1";;
-    -h|--help) sed -n 2,17p "$0"; exit 0;;
+    --engine) [ $# -gt 1 ] || die "--engine needs a value"; ENGINE="$2"; shift;;
+    --install|--start|--cybench-run|--cleanup|--cybench-summary|--speed) ACTION="$1"; if [ $# -gt 1 ] && [[ "$2" != --* ]]; then ARG1="$2"; shift; fi;;
+    --stop|--status|--cybench-setup|--list|--parity) ACTION="$1";;
+    -h|--help) sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d'; exit 0;;
     *) die "unknown option $1";;
   esac; shift
 done
 case "$ACTION" in
   "") menu;;
-  --install) install_model "$ARG1";;
-  --start) start_model "$ARG1";;
+  --list) list_models;;
+  --install) install_model "$ARG1" "$ENGINE";;
+  --start) start_model "$ARG1" "$ENGINE";;
   --stop) stop_all;; --status) status;;
+  --speed) speed speed "$ARG1";; --parity) speed parity;;
   --cybench-setup) cybench_setup;; --cybench-run) cybench_run "${ARG1:-10}";;
   --cybench-summary) cybench_summary "$ARG1";;
   --cleanup) cleanup "$ARG1";;
