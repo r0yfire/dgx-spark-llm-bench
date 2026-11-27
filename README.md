@@ -14,7 +14,7 @@ One script to install, serve, benchmark and clean up abliterated ("uncensored") 
 | `qwen27b-abl`: [Qwen3.8-27B Uncensored](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | `tensorfold` ([MLX 4-bit](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX)), `vllm` ([NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4)) | Dense 27B hybrid model. TensorFold drafts with [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2); vLLM with the model's MTP head. The NVFP4 repo is gated. |
 | `cybertiel`, `cybertiel-q8`: [CyberTiel Coder 35B-A3B](https://huggingface.co/peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP) | `polystrata`, `llamacpp` | MoE with 3B active parameters, GGUF `UD-Q4_K_XL` or `UD-Q8_K_XL`, MTP draft head in the file. |
 
-Every model is served with a 262,144-token context window behind an OpenAI-compatible API on port `8000`, protected by a randomly generated API key. Only one model runs at a time.
+Every model is served with a 262,144-token context window behind an OpenAI-compatible API on port `8000`, protected by a randomly generated API key that every inference route requires (the script checks this at each start). Only one model runs at a time.
 
 The script also measures tokens per second (prefill and decode) on the running model, and can run a subset of [Cybench](https://github.com/andyzorigin/cybench) (a CTF benchmark for LLM agents) against it.
 
@@ -23,9 +23,9 @@ The script also measures tokens per second (prefill and decode) on the running m
 
 ## Results
 
-Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: every engine gets the same prompts through the same streaming client, temperature 0, 512-token answers, thinking off, 3 runs per cell, medians. Prefill is prompt tokens divided by time to first token; decode is the answer's tokens divided by the time from the first to the last. The needle test hides a code at one third of a ~208,600-token prompt and asks for it back.
+Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: every engine gets the same prompts through the same streaming client, temperature 0, 512-token answers, thinking off, 3 runs per cell, medians. Prefill is prompt tokens divided by time to first token; decode is the answer's tokens minus one (`completion_tokens - 1`, as reported by the server) divided by the time from the first streamed token to the last. The prompt cases are named by nominal size (`4k`, `16k`, `32k`); the prompts the engines actually counted were about 3,860-4,050 tokens (4k), 14,250-14,430 (16k) and 27,770-27,950 (32k), depending on the model's tokenizer. The needle test hides a code at one third of a ~208,600-token prompt and asks for it back.
 
-| Model | Engine | Decode tok/s (4K / 16K / 28K prompt) | Prefill tok/s (4K / 16K / 28K) | ~208K needle |
+| Model | Engine | Decode tok/s (4k / 16k / 32k case) | Prefill tok/s (4k / 16k / 32k case) | ~208K needle |
 |---|---|---|---|---|
 | Qwen3.8-27B Uncensored | vLLM, NVFP4, MTP 2 drafts (previous default) | 18.9 / 18.0 / 16.9 | 1,887 / 1,971 / 1,808 | found, first token after 259 s |
 | Qwen3.8-27B Uncensored | vLLM, NVFP4, MTP 4 drafts | 20.7 / 20.2 / 19.4 | 1,959 / 1,984 / 1,783 | found, 262 s |
@@ -35,8 +35,8 @@ Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: ev
 
 What these show:
 
-- **Qwen3.8-27B:** TensorFold decodes about 3 times as fast as vLLM. vLLM reads prompts faster below ~32K, and at ~208K the two are level. vLLM's best setting is 4 MTP drafts: 6 drafts and a 16K prefill batch measured no better (prefill at 16K and 32K got slower with the larger batch). TensorFold with an FP8 KV cache decoded slower (50–53 tok/s) than with the default cache.
-- **CyberTiel:** PolyStrata decodes 12–15% faster than llama.cpp and reads prompts about 60% faster, on the same GGUF file. Greedy answers to 5 fixed prompts (`--parity`) were identical on 3; the other 2 parted at a near-tie token after 65 and 160 characters, both still correct. PolyStrata's own docs note its fused kernels round slightly differently from llama.cpp's.
+- **Qwen3.8-27B:** TensorFold decodes about 3 times as fast as vLLM. vLLM reads prompts faster in the 4k to 32k cases, and at ~208K the two are level. vLLM's best setting is 4 MTP drafts: 6 drafts and a 16K prefill batch measured no better (prefill in the 16k and 32k cases got slower with the larger batch). TensorFold with an FP8 KV cache decoded slower (50–53 tok/s) than with the default cache.
+- **CyberTiel:** PolyStrata decodes 9-15% faster than llama.cpp (15% in the 4k case, 9% at 16k, 15% at 32k) and reads prompts about 60% faster, on the same GGUF file. Greedy answers to 5 fixed prompts (`--parity`) were identical on 3; the other 2 parted at a near-tie token after 65 and 160 characters, both still correct. PolyStrata's own docs note its fused kernels round slightly differently from llama.cpp's.
 - The two Qwen3.8-27B engines read different 4-bit formats of the same OrcaRouter weights (MLX affine 4-bit for TensorFold, NVFP4 for vLLM), so their answers are not expected to match token for token.
 - Single runs on one machine; expect a few percent of variation between sessions.
 
@@ -44,9 +44,9 @@ What these show:
 
 - Interactive menu, plus flags for scripting
 - One registry row per model and engine: each engine downloads the format it reads
-- Downloads weights with the Hugging Face CLI (installed into its own venv), pulls the arm64 container images, builds PolyStrata's `strata-poly` for `sm_121`, and installs TensorFold's release after checking its SHA-256
+- Downloads weights with the Hugging Face CLI (installed into its own venv), pulls the arm64 container images, builds PolyStrata's `strata-poly` for `sm_121`, and installs TensorFold's release after checking it against a SHA-256 pinned in the script
 - Spark-specific settings: `sm_121a` kernels, FlashInfer NVFP4 GEMM, conservative GPU memory use on unified memory
-- Speculative decoding on every engine (MTP, or DFlash2 on TensorFold)
+- Speculative decoding on every engine: MTP (vLLM and llama.cpp turn it on with a flag; PolyStrata's `strata-poly` uses the GGUF's MTP head on its own), or DFlash2 on TensorFold
 - `--speed` and `--parity` benchmarks of the running model
 - Cybench setup and runs, patched to work with a local endpoint, with per-task result tables
 - Tiered clean-up: stop servers, remove images, delete weights, or remove everything
@@ -87,7 +87,7 @@ The menu lists every model and engine pair:
    x) Clean up                 q) Quit
 ```
 
-The first start can take several minutes while weights load and kernels compile. The script waits until the API answers.
+The first start can take several minutes while weights load and kernels compile. The script waits until the API answers, then checks that it refuses requests without the key. Picking a model that is not installed yet installs it first.
 
 ## Usage
 
@@ -99,7 +99,7 @@ The first start can take several minutes while weights load and kernels compile.
 ./spark-llm.sh --status
 ./spark-llm.sh --stop
 
-./spark-llm.sh --speed                             # tokens/s of the running model (short, 4K, 16K, 32K prompts)
+./spark-llm.sh --speed                             # tokens/s of the running model (short, 4k, 16k, 32k cases)
 SPEED_NEEDLE=236000 ./spark-llm.sh --speed 4k      # one prompt size, plus a ~208K-token needle test
 ./spark-llm.sh --parity                            # greedy answers to fixed prompts, to compare engines
 
@@ -123,19 +123,19 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "CyberTiel", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-The served model names are `Qwen3.8-27B-Uncensored` and `CyberTiel`, whichever engine runs them. Any OpenAI-compatible client works with base URL `http://<spark-ip>:8000/v1` and the key above. On vLLM, Qwen runs with a reasoning parser and tool calling (`qwen3_coder`) turned on. To turn thinking off for a request, send `"chat_template_kwargs": {"enable_thinking": false}`; every engine here honors it.
+The served model names are `Qwen3.8-27B-Uncensored` and `CyberTiel`, whichever engine runs them. Any OpenAI-compatible client works with base URL `http://<spark-ip>:8000/v1` and the key above. On vLLM, Qwen runs with a reasoning parser and tool calling (`qwen3_coder`) turned on. To turn thinking off for a request, send `"chat_template_kwargs": {"enable_thinking": false}`. `--speed` sends it and flags any run that still produced reasoning.
 
 ## Engines
 
 ### PolyStrata, from a fork
 
-PolyStrata runs mixture-of-experts GGUF models with its own CUDA engine, `strata-poly`. Upstream ships no aarch64 build of it, and it did not compile on aarch64: two files included the x86-only `<immintrin.h>` for a spin-wait hint. The [`spark-aarch64` branch of our fork](https://github.com/r0yfire/PolyStrata/tree/spark-aarch64) uses PolyStrata's own portable `cpu_relax.hpp` there instead (the same instruction on x86, `yield` on Arm). The script clones that branch at a pinned commit (`PS_REPO`, `PS_REF`), builds `strata-poly` for `sm_121`, exports the model's tokenizer and serves it with PolyStrata's server. With all experts resident on the Spark, PolyStrata's advantage over llama.cpp comes from its kernels, not from expert offloading.
+PolyStrata runs mixture-of-experts GGUF models with its own CUDA engine, `strata-poly`. Upstream ships no aarch64 build of it, and it did not compile on aarch64: two files included the x86-only `<immintrin.h>` for a spin-wait hint. The [`spark-aarch64` branch of our fork](https://github.com/r0yfire/PolyStrata/tree/spark-aarch64) uses PolyStrata's own portable `cpu_relax.hpp` there instead (the same instruction on x86, `yield` on Arm). The script clones that branch at a pinned commit (`PS_REPO`, `PS_REF`), builds `strata-poly` for `sm_121`, exports the model's tokenizer and serves it with PolyStrata's server. `strata-poly` drafts with the GGUF's own MTP head without being asked (its log reports how many drafts were accepted), so the script passes it no speculative-decoding flag, while llama.cpp gets `--spec-type draft-mtp`. With all experts resident on the Spark, PolyStrata's advantage over llama.cpp comes from its kernels, not from expert offloading.
 
 PolyStrata's Spark-supported Qwen3.8-Flash-Next path uses a separate engine and is not wired into this script yet.
 
 ### TensorFold
 
-TensorFold's native release (CUDA kernels embedded in the binary) serves Qwen3.8-27B from an MLX affine 4-bit checkpoint, drafting with DFlash2. The script installs release `TF_VERSION` after checking the published SHA-256, and passes the API key through `--api-key-file`. The native release does not accept `--prefill-fp8` yet (only TensorFold's Python engine does), which is why its prefill trails vLLM on shorter prompts.
+TensorFold's native release (CUDA kernels embedded in the binary) serves Qwen3.8-27B from an MLX affine 4-bit checkpoint, drafting with DFlash2. The script installs release `TF_VERSION` only if the tarball matches the SHA-256 pinned in the script (`TF_SHA256`; the release's own `.sha256` file is not trusted, since release assets can be replaced), and passes the API key through `--api-key-file`. The native release does not accept `--prefill-fp8` yet (only TensorFold's Python engine does), which is why its prefill trails vLLM on shorter prompts.
 
 ### vLLM
 
@@ -149,13 +149,14 @@ All settings are environment variables with sensible defaults:
 |---|---|---|
 | `SPARK_LLM_HOME` | `~/spark-llm` | Where weights, engines, venv, Cybench, results and the API key live |
 | `PORT` | `8000` | Host port for the API |
+| `BIND` | `0.0.0.0` | Address the API listens on: `0.0.0.0` for every interface (LAN clients), `127.0.0.1` for this machine only. IPv4 only. See [Security notes](#security-notes). |
 | `CTX` | `262144` | Context window |
 | `VLLM_GPU_UTIL` | `0.70` | vLLM memory share. Keep it at or below 0.8 on unified memory. |
-| `VLLM_SPEC` | `{"method":"mtp","num_speculative_tokens":4}` | vLLM's `--speculative-config` |
+| `VLLM_SPEC` | `{"method":"mtp","num_speculative_tokens":4}` | vLLM's `--speculative-config`. `VLLM_SPEC=` (empty) turns speculative decoding off. |
 | `VLLM_IMAGE` | `ghcr.io/aeon-7/aeon-vllm-ultimate:latest` | vLLM image built for the Spark |
 | `LLAMA_IMAGE` | `ghcr.io/ggml-org/llama.cpp:server-cuda13` | llama.cpp server image |
 | `PS_REPO` / `PS_REF` | our fork / a pinned commit | PolyStrata source to build |
-| `TF_VERSION` | `1.3.6` | TensorFold release |
+| `TF_VERSION` / `TF_SHA256` | `1.3.6` / that release's tarball hash | TensorFold release, and the SHA-256 its tarball must match. Another version needs its own `TF_SHA256`. |
 | `DRAFTER_27B_REPO` | `z-lab/Qwen3.8-27B-DFlash2` | DFlash2 drafter for Qwen3.8-27B |
 | `VLLM_EXTRA` / `LLAMA_EXTRA` / `TF_EXTRA` | – | Extra arguments for vLLM, llama.cpp or TensorFold (`QWEN_EXTRA` / `TIEL_EXTRA` still work) |
 | `SPEED_RUNS` / `SPEED_NEEDLE` | `3` / `0` | Runs per prompt size; needle prompt size in tokens (0 skips it) |
@@ -169,11 +170,12 @@ All settings are environment variables with sensible defaults:
 
 `speedtest.py` (standard-library Python, no dependencies) drives any OpenAI-compatible server:
 
-- Each prompt is real source code (the Python standard library on the machine, read in a fixed order) and starts with a random nonce, so no prefix or conversation cache can skip the prefill.
-- Token counts come from the server's own `usage` (`stream_options.include_usage`).
-- `--needle N` checks long context; `--parity` saves greedy answers to fixed prompts; `--table FILES...` prints a markdown table of result files.
+- Each prompt is real source code (the Python standard library on the machine, read in a fixed order) and starts with a random nonce, so no prefix or conversation cache can skip the prefill. The cases (`short`, `4k`, `16k`, `32k`, ...) are named by nominal size; each run records the prompt tokens the engine actually counted.
+- Token counts come only from the server's own `usage` (`stream_options.include_usage`). A run without `usage` gets no rates (shown as `n/a`, flagged `no_usage`) rather than a count of streamed chunks, which would understate decode for engines that send several drafted tokens per chunk.
+- Runs are flagged, and left out of the medians, when the model produced reasoning even though thinking was turned off: streamed reasoning, a `<think>` tag in the answer, `reasoning_tokens` in `usage`, or more completion tokens than the streamed text can hold, or under 2 characters per token (a heuristic): signs of hidden reasoning, which would make prefill look slow and decode look fast. Flagged runs are printed with a warning and kept in the JSON.
+- `--needle N` checks long context; `--parity` saves greedy answers to fixed prompts; `--table FILES...` prints a markdown table of result files, one row per label and engine configuration.
 
-`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`.
+`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`, including the engine configuration the model was started with (`meta`: image and image ID, `VLLM_SPEC`, `CTX`, PolyStrata commit, TensorFold version, extra arguments).
 
 ## Benchmarking with Cybench
 
@@ -221,11 +223,13 @@ Keep these caveats in mind:
 ```
 ~/spark-llm/
 ├── .api_key            # random bearer key (mode 600)
-├── .active             # which model and engine are running
+├── .active             # which model and engine are running, and the address it listens on
+├── .active.json        # the running engine's configuration (recorded in --speed results)
 ├── models/             # downloaded weights, one folder per model and format
 ├── polystrata/         # PolyStrata checkout and its strata-poly build
 ├── polystrata-data/    # tokenizer packs and run configs
 ├── tensorfold/         # TensorFold release
+├── vllm-auth/          # the key-checking middleware mounted into the vLLM container
 ├── venv/               # Hugging Face CLI
 ├── speed/              # speed and parity results (JSON)
 ├── logs/               # native engines' server logs
@@ -238,16 +242,19 @@ Keep these caveats in mind:
 - **`Access denied ... requires approval` when downloading.** Request access on the model page, then set `HF_TOKEN` or run `hf auth login`.
 - **`cannot talk to Docker`.** Add your user to the `docker` group and log in again.
 - **`port 8000 is still in use after stopping everything`.** Something outside the script holds the port: `ss -ltnp '( sport = :8000 )'` shows what.
-- **PolyStrata or TensorFold exits at start.** Read `~/spark-llm/logs/polystrata-server.log` or `~/spark-llm/logs/tensorfold-<model>.log`. A failed PolyStrata build logs to `~/spark-llm/logs/polystrata-build.log`.
+- **`did not refuse requests without a valid key`.** A server answered an unauthenticated request after start, so the script stopped it. The lines above the error name each path and status. Do not work around it: the engine's key handling has to be fixed first.
+- **PolyStrata or TensorFold exits at start.** Read `~/spark-llm/logs/polystrata-server.log` or `~/spark-llm/logs/tensorfold-<model>.log`. A failed PolyStrata build logs to `~/spark-llm/logs/polystrata-build.log`. The native engines start with a reduced environment (see Security notes); a variable they need that is not on the list in `scrub_env` has to be added there.
 - **Out-of-memory errors or a slow system.** Lower `CTX` (or `VLLM_GPU_UTIL` for vLLM). Unified memory is shared with the OS.
 - **A Cybench task shows `NOT RUN`.** Read `results/<run>/task-N.log`. The usual causes are an x86-only challenge, a failed Docker build, or a leftover container holding a port. The script removes a task's containers after each task.
 
 ## Security notes
 
-- The API listens on `0.0.0.0:8000`, so anyone on your network can reach it, but every request needs the generated key. Firewall the port if you don't want it on your LAN.
-- The API key, and Cybench's `.env` that contains it, are written with mode `600` and are never printed. Native engines get it from that file (TensorFold) or through the environment (PolyStrata), not on the command line.
-- The script never stores or logs your Hugging Face token.
-- PolyStrata is built from a pinned commit of our fork, and TensorFold's release is checked against its published SHA-256 before use.
+- By default the API listens on every interface (`BIND=0.0.0.0`), so other machines on your network can reach it. `BIND=127.0.0.1` keeps it to this machine; Cybench then cannot reach it, because its agent container connects over the LAN address.
+- Firewalls: ports that Docker publishes (vLLM and llama.cpp) bypass ufw. Docker redirects their traffic in the `nat` table before it reaches the `INPUT` chain ufw uses, so `ufw deny 8000` does not block them. Put such rules in Docker's `DOCKER-USER` chain instead, for example `sudo iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 8000 ! -s 192.168.1.0/24 -j DROP` to allow only your LAN (see Docker's "Packet filtering and firewalls" docs). The native engines (PolyStrata, TensorFold) listen on the host directly, so ufw does cover them.
+- Every inference route of every engine needs the key. vLLM's own key check covers only `/v1`, `/v2`, `/inference` and `/cohere`, and its `POST /invocations` would serve the model without one, so the script mounts a small middleware into the vLLM container (`$SPARK_LLM_HOME/vllm-auth/spark_llm_auth.py`, loaded with `--middleware`) that requires the key on every route except `/health` and `/ping`. After every start the script proves it: POSTs without a key and with a wrong key to `/v1/chat/completions` (and, on vLLM, `/invocations`) must get 401 or 403, and other inference paths must refuse too or not exist. Otherwise the script stops the server and exits with an error. Health checks, and llama.cpp's model list (`/v1/models`), answer without a key.
+- The API key, and Cybench's `.env` that contains it, are written with mode `600`, are never printed (not even by `--dry-run`), and never appear on a command line: vLLM reads it from `VLLM_API_KEY` in its container's environment, llama.cpp and TensorFold from the key file (`--api-key-file`; read-only mount for llama.cpp), PolyStrata from `STRATA_API_KEY`, and the script's own `curl` checks from standard input (`curl -K -`). Members of the `docker` group can still read it with `docker inspect`, but that group is equivalent to root anyway.
+- The script never stores or logs your Hugging Face token. The native engines start with a reduced environment (paths, locale, CUDA/NVIDIA, Python and engine variables), so your token and other credentials exported in the shell do not reach them.
+- What is pinned: PolyStrata's source (a commit of our fork, `PS_REF`) and TensorFold's release tarball (its SHA-256, `TF_SHA256`, recorded in the script; another `TF_VERSION` needs its own `TF_SHA256`). What is not: the container images are pulled by tag (set `VLLM_IMAGE` / `LLAMA_IMAGE` to `image@sha256:<digest>` to pin them; `docker image inspect --format '{{index .RepoDigests 0}}' <image>` prints the digest you have), the Hugging Face CLI and PolyStrata's Python requirements come from PyPI unpinned, and vLLM runs with `--trust-remote-code` on the model repo.
 - Cybench task containers run with `--privileged`, as upstream does. Run benchmarks only on a machine you're comfortable using for that.
 
 ## Acknowledgements
