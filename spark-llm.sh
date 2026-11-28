@@ -5,7 +5,8 @@
 # (bearer key required on every inference route; checked at each start). Each engine reads its own format of the same weights:
 #   vllm        vLLM, Spark build (AEON image)               NVFP4 checkpoints
 #   llamacpp    llama.cpp server (CUDA 13, arm64)            GGUF
-#   polystrata  PolyStrata (r0yfire fork, built for GB10)     GGUF MoE models, natively (no Docker)
+#   polystrata  PolyStrata (r0yfire fork), natively           GGUF MoE models: CyberTiel on strata-poly (built here for GB10),
+#                                                            Qwen3.8-Flash-Next on the Strata engine (signed release) + DFlash2
 #   tensorfold  TensorFold native release (CUDA, sm_121)     MLX 4-bit checkpoints + DFlash2 drafter, natively
 # Interactive menu by default. Flags for scripting:
 #   --list                                    models and the engines each one runs on
@@ -44,12 +45,28 @@ CTX="${CTX:-262144}"
 PS_REPO="${PS_REPO:-https://github.com/r0yfire/PolyStrata.git}"
 PS_REF="${PS_REF:-34e454bbefe03ddd0cd449bce85c1fd2f8ba4029}"
 PS_DIR="$BASE/polystrata"; PS_DATA="$BASE/polystrata-data"; PS_PID="$BASE/.polystrata.pid"
+# Qwen3.8-Flash-Next runs on the Strata project's engine `strata`, not on strata-poly. Its pieces, each from PolyStrata's own tools
+# (the same steps its setup.py runs, which has no option to install them without the stock model's 84 GB download):
+#   the engine   `strata update --no-control` into PS_STORE: setup.py engine_from_feed (the signed feed of PS_REF's release)
+#   CUDA libs    the cuBLAS / CUDA runtime wheels setup.py installs for that engine (CUDA_WHEELS at PS_REF)
+#   the drafter  `strata drafting fetch`: the tuned DFlash2 drafter of Qwen3.8-Flash-Next IQ3_S (drafting.TUNED_NAME, pinned SHA-256)
+PS_STORE="$PS_DIR/terminal/engine-feed"
+PS_CUDA_WHEELS="nvidia-cublas==13.0.2.14 nvidia-cuda-runtime==13.0.96"
+PS_DRAFTER_SET="qwen3.8-flash-next-iq3_s"
+PS_DRAFTER="$PS_DATA/dflash2/qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack"
+# EXPERIMENTAL, stock Flash-Next on PolyStrata only: PolyStrata's refusal-direction projection (setup's --experimental-speed-projection on)
+PS_REFUSAL_PROJECTION="${PS_REFUSAL_PROJECTION:-off}"
+PS_PROJECTION_FILE="$PS_DIR/terminal/data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+# llama.cpp, flashnext-abl only: also draft with OrcaRouter's separate MTP draft model (-md). Not measured on the Spark yet: off by default.
+LLAMA_ABL_MTP="${LLAMA_ABL_MTP:-off}"
+FN_ABL_DRAFT="Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf"
 KEYFILE="$BASE/.api_key"; ACTIVE="$BASE/.active"; ACTIVE_META="$BASE/.active.json"
 YES=0; DRY=0
 
 # Model registry, one row per (model, engine): each engine reads its own format of the same weights.
-#   key|engine|title|HF repo|--include pattern ("," separates several)|folder under models/|served name
+#   key|engine|title|HF repo[@revision]|--include pattern ("," separates several)|folder under models/|served name
 # A model's first row is its default engine: the fastest one measured on the Spark (README, "Results").
+# Flash-Next stock: the GSQ-RCO files at the revision PolyStrata's setup.py pins (HF_REVISIONS), so they are the bytes it checks.
 MODELS=(
  "qwen27b-abl|tensorfold|Qwen3.8-27B Uncensored, MLX 4-bit + DFlash2|orcarouter/Qwen3.8-27B-Uncensored-MLX|4-bit/*|qwen27b-abl-mlx|Qwen3.8-27B-Uncensored"
  "qwen27b-abl|vllm|Qwen3.8-27B Uncensored, NVFP4 + MTP|orcarouter/Qwen3.8-27B-Uncensored-NVFP4||qwen-nvfp4|Qwen3.8-27B-Uncensored"
@@ -57,6 +74,10 @@ MODELS=(
  "cybertiel|llamacpp|CyberTiel 35B-A3B UD-Q4_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q4_K_XL.gguf|cybertiel-q4|CyberTiel"
  "cybertiel-q8|polystrata|CyberTiel 35B-A3B UD-Q8_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q8_K_XL.gguf|cybertiel-q8|CyberTiel"
  "cybertiel-q8|llamacpp|CyberTiel 35B-A3B UD-Q8_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q8_K_XL.gguf|cybertiel-q8|CyberTiel"
+ "flashnext|polystrata|Qwen3.8-Flash-Next IQ3_S (GSQ-RCO) + DFlash2|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000*|flashnext-iq3s|Qwen3.8-Flash-Next"
+ "flashnext|llamacpp|Qwen3.8-Flash-Next IQ3_S (GSQ-RCO)|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000*|flashnext-iq3s|Qwen3.8-Flash-Next"
+ "flashnext-abl|polystrata|Qwen3.8-Flash-Next Uncensored IQ3_XXS + DFlash2|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
+ "flashnext-abl|llamacpp|Qwen3.8-Flash-Next Uncensored IQ3_XXS|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*,Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
 )
 # DFlash2 drafter for the Qwen3.8-27B family (TensorFold drafts with it; vLLM can too via VLLM_SPEC)
 DRAFTER_27B_REPO="${DRAFTER_27B_REPO:-z-lab/Qwen3.8-27B-DFlash2}"
@@ -143,21 +164,24 @@ need_docker(){
   docker info >/dev/null 2>&1 || die "cannot talk to Docker (is $USER in the docker group?)"
 }
 make_dirs(){ [ "$DRY" = 1 ] || mkdir -p "$BASE/models" "$BASE/logs" "$BASE/results" "$BASE/speed"; }
-preflight(){   # $1 engine (optional): before an install. Docker only for the Docker engines; disk space for the download.
+preflight(){   # $1 engine (optional), $2 GB the install needs (default 80): before an install. Docker only for the Docker engines.
   if [ -z "${1:-}" ] || is_docker_engine "$1"; then need_docker; fi
   make_dirs
-  local d=$BASE free; while [ ! -d "$d" ]; do d=$(dirname "$d"); done   # a dry run creates nothing: measure the nearest existing parent
+  local d=$BASE free want=${2:-80}; while [ ! -d "$d" ]; do d=$(dirname "$d"); done   # a dry run creates nothing: measure the nearest existing parent
   free=$(df -BG --output=avail "$d" | tail -1 | tr -dc 0-9)
-  [ "${free:-0}" -ge 80 ] || die "need ~80 GB free in $BASE (have ${free:-?} GB)"
+  [ "${free:-0}" -ge "$want" ] || die "need ~$want GB free in $BASE (have ${free:-?} GB)"
 }
+disk_gb(){ case "$1" in flashnext*) echo 90;; *) echo 80;; esac; }   # $1 model: GB an install needs (Flash-Next: 85 GB of GGUF + pack, engine)
 
 download(){   # $1 model, $2 engine
-  local repo inc p; repo=$(field "$1" "$2" 4); inc=$(field "$1" "$2" 5)
+  local spec repo rev="" inc p; spec=$(field "$1" "$2" 4); inc=$(field "$1" "$2" 5)
+  repo=${spec%%@*}; if [[ "$spec" == *@* ]]; then rev=${spec#*@}; fi
   [ -n "${HF_TOKEN:-}" ] || [ -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ] || \
     say "Note: some repos are gated. Request access on Hugging Face, then export HF_TOKEN or run 'hf auth login'."
-  say "Downloading $repo${inc:+ ($inc)}"
+  say "Downloading $repo${rev:+ at $rev}${inc:+ ($inc)}"
   # one --include per pattern: `hf download` reads a second pattern after one flag as a file name
   local args=(); IFS=',' read -ra pats <<<"$inc"; for p in "${pats[@]}"; do [ -n "$p" ] && args+=(--include "$p"); done
+  if [ -n "$rev" ]; then args+=(--revision "$rev"); fi
   run "$BASE/venv/bin/hf" download "$repo" "${args[@]}" --local-dir "$(mdir "$1" "$2")"
 }
 
@@ -165,7 +189,7 @@ drafter_27b(){ echo "$BASE/models/qwen27b-dflash2"; }
 needs_drafter(){ [[ "$1" == qwen27b* ]] && { [ "$2" = tensorfold ] || [[ "$2" = vllm && "$VLLM_SPEC" == *dflash* ]]; }; }
 
 install_model(){   # $1 model, $2 engine (optional)
-  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight "$e"; hf_cli
+  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight "$e" "$(disk_gb "$m")"; hf_cli
   download "$m" "$e"
   if needs_drafter "$m" "$e"; then
     say "Downloading the DFlash2 drafter ($DRAFTER_27B_REPO)"
@@ -174,7 +198,7 @@ install_model(){   # $1 model, $2 engine (optional)
   case "$e" in
     vllm) run docker pull "$VLLM_IMAGE" ;;
     llamacpp) run docker pull "$LLAMA_IMAGE" ;;
-    polystrata) ps_install ;;
+    polystrata) ps_install "$m" ;;
     tensorfold) tf_install ;;
     *) die "engine '$e' is not wired into install_model" ;;
   esac
@@ -182,10 +206,19 @@ install_model(){   # $1 model, $2 engine (optional)
 }
 
 # ---------------------------------------------------------------- PolyStrata (native, not Docker)
-# strata-poly has no aarch64 release package, so it is built here for the GB10 (sm_121) from the pinned fork.
-ps_install(){
-  need git; need cmake; need python3
-  local nvcc=/usr/local/cuda/bin/nvcc; [ -x "$nvcc" ] || nvcc=$(command -v nvcc) || die "the CUDA 13 toolkit (nvcc) is needed"
+# One engine name, two engine programs behind the same server (serve/server.py --engine strata), the same key, PID file and stop:
+#   poly    strata-poly, built here from the pinned fork (CyberTiel): its run config is written by ps_poly_config
+#   strata  the Strata project's engine, PolyStrata's signed release for this machine (Qwen3.8-Flash-Next): ps_strata_config
+ps_kind(){ case "$1" in flashnext*) echo strata;; *) echo poly;; esac; }   # $1 model
+
+ps_install(){   # $1 model
+  local kind nvcc=""; kind=$(ps_kind "$1")
+  need git
+  if [ "$kind" = poly ]; then   # strata-poly has no aarch64 release package: it is built here for the GB10 (sm_121)
+    need cmake
+    nvcc=/usr/local/cuda/bin/nvcc; [ -x "$nvcc" ] || nvcc=$(command -v nvcc) || die "the CUDA 13 toolkit (nvcc) is needed"
+  fi
+  need python3
   if [ ! -d "$PS_DIR/.git" ]; then say "Cloning PolyStrata ($PS_REPO)"; run git clone -q "$PS_REPO" "$PS_DIR"; fi
   run git -C "$PS_DIR" fetch -q origin "$PS_REF" 2>/dev/null || true
   run git -C "$PS_DIR" checkout -q "$PS_REF"
@@ -194,6 +227,14 @@ ps_install(){
     run python3 -m venv "$PS_DIR/terminal/.venv"
   fi
   run "$PS_DIR/terminal/.venv/bin/pip" install -q --disable-pip-version-check -r "$PS_DIR/terminal/requirements.txt" ninja
+  case "$kind" in
+    poly) ps_build_poly "$nvcc" ;;
+    strata) ps_strata_install "$1" ;;
+  esac
+}
+
+ps_build_poly(){   # $1 nvcc
+  local nvcc=$1
   [ "$DRY" = 1 ] && return
   local stamp="$PS_DIR/build-poly-spark/.built-from"
   if [ -x "$PS_DIR/build-poly-spark/strata-poly" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$PS_REF" ]; then
@@ -210,9 +251,146 @@ ps_install(){
   echo "$PS_REF" > "$stamp"
 }
 
-first_gguf(){ [ -d "$1" ] || return 0; find "$1" -name '*.gguf' | sort | head -1; }   # $1 dir; empty when none (or no dir)
+# The model's GGUF (its first shard), never a separate draft model or image projector in the same folder; empty when none (or no dir)
+first_gguf(){ [ -d "$1" ] || return 0; find -H "$1" -name '*.gguf' ! -iname '*mtp-draft*' ! -iname 'mmproj*' | sort | head -1; }   # $1 dir (may be a link)
+gguf_shards(){   # $1 first GGUF -> the path of every shard, in order ($1 alone when the file is not split)
+  local g=$1 stem n i
+  if [[ "$g" =~ ^(.*)-00001-of-([0-9]{5})\.gguf$ ]]; then
+    stem=${BASH_REMATCH[1]}; n=${BASH_REMATCH[2]}
+    for ((i = 1; i <= 10#$n; i++)); do printf '%s-%05d-of-%s.gguf\n' "$stem" "$i" "$n"; done
+  else echo "$g"; fi
+}
+missing_shards(){ local s; while IFS= read -r s; do [ -s "$s" ] || echo "GGUF shard $(basename "$s")"; done < <(gguf_shards "$1"); }   # $1 first GGUF
 
-ps_config(){   # $1 model -> prints ONLY the path of its PolyStrata run config (tokenizer pack + JSON); messages go to stderr
+# ---------------------------------------------------------------- PolyStrata: the Strata engine (Qwen3.8-Flash-Next)
+ps_py(){ echo "$PS_DIR/terminal/.venv/bin/python"; }
+# PolyStrata's own CLI (terminal/strata.py), from its folder, allowed to download (STRATA_NO_ACQUIRE would refuse it)
+ps_cli(){ run env -C "$PS_DIR/terminal" -u STRATA_NO_ACQUIRE "$@"; }
+ps_engine_installed(){ compgen -G "$PS_STORE/engine/*/strata" >/dev/null; }   # an engine package in PS_STORE (the start checks it in full)
+ps_cuda_libs(){ compgen -G "$PS_DIR/terminal/.venv/lib/python3*/site-packages/nvidia/*/lib/libcublas.so.13*" >/dev/null; }
+ps_pack_dir(){ echo "$PS_DATA/packs/$1"; }   # $1 model
+# per model, from PolyStrata's own steps: setup.py packs the GSQ-RCO files as they are; docs/ORCA.md packs OrcaRouter's with
+# --compat-bf16 (its quantized hyper-connection, attention and PLE projections become the BF16 the kernels read)
+ps_pack_args(){ case "$1" in flashnext-abl) echo "--compat-bf16";; *) echo "";; esac; }
+ps_pack_want(){ echo "$(basename "$2") $(ps_pack_args "$1")"; }   # $1 model, $2 first GGUF: what the pack's stamp must say
+ps_pack_ok(){ local g; g=$(first_gguf "$(mdir "$1" polystrata)"); [ -n "$g" ] && [ "$(cat "$(ps_pack_dir "$1")/.spark-llm-pack" 2>/dev/null)" = "$(ps_pack_want "$1" "$g")" ]; }
+# The GGUF that holds the PLE (n-gram) table, for --ple-gguf: the last shard of the GSQ-RCO files (setup.py's config),
+# the FIRST shard of OrcaRouter's (docs/ORCA.md: "Orca's PLE table is in shard 1")
+ps_ple_gguf(){ case "$1" in flashnext-abl) echo "$2";; *) gguf_shards "$2" | tail -1;; esac; }   # $1 model, $2 first GGUF
+ps_projection(){ if [ "$1" = flashnext ] && [ "$PS_REFUSAL_PROJECTION" = on ]; then echo on; else echo off; fi; }   # $1 model
+
+ps_strata_install(){   # $1 model: the CUDA libraries, the engine, the drafter and the model's pack. Each step is skipped when done.
+  local m=$1 py g pack pargs; py=$(ps_py)
+  # shellcheck disable=SC2086   # PS_CUDA_WHEELS is a list of pinned requirements
+  run "$PS_DIR/terminal/.venv/bin/pip" install -q --disable-pip-version-check $PS_CUDA_WHEELS
+  if ps_engine_installed; then
+    say "Strata engine already installed ($PS_STORE)"
+  else
+    # PolyStrata's updater does not install an engine while a model is loaded: stop ours rather than let it ask to
+    if [ "$DRY" = 0 ] && native_alive "$PS_PID" "$PS_MARK"; then die "PolyStrata is serving a model: run --stop first, then install again"; fi
+    say "Installing the Strata engine from PolyStrata's signed update feed (setup.py's own step)"
+    ps_cli STRATA_COMPONENTS_DIR="$PS_STORE" STRATA_ENGINE_BACKEND=cuda "$py" strata.py update --no-control --yes
+    [ "$DRY" = 1 ] || ps_engine_installed || die "PolyStrata's update installed no engine into $PS_STORE (see above)"
+  fi
+  if [ -s "$PS_DRAFTER" ]; then
+    say "DFlash2 drafter already here ($PS_DRAFTER)"
+  else
+    say "Fetching the DFlash2 drafter (PolyStrata's tuned one for Qwen3.8-Flash-Next)"
+    run mkdir -p "$PS_DATA"
+    ps_cli "$py" strata.py drafting fetch --data-dir "$PS_DATA" --model "$PS_DRAFTER_SET"
+    [ "$DRY" = 1 ] || [ -s "$PS_DRAFTER" ] || die "the drafter fetch did not produce $PS_DRAFTER (see above)"
+  fi
+  g=$(first_gguf "$(mdir "$m" polystrata)"); pack=$(ps_pack_dir "$m"); pargs=$(ps_pack_args "$m")
+  if ps_pack_ok "$m"; then say "PolyStrata pack of $m is up to date ($pack)"; return; fi
+  if [ "$DRY" = 0 ]; then
+    [ -n "$g" ] || die "no GGUF under $(mdir "$m" polystrata)"
+    [ -z "$(missing_shards "$g")" ] || die "the download of $m is incomplete: $(missing_shards "$g" | paste -sd' ' -)"
+  fi
+  say "Packing $m for the Strata engine (tools/iq_pack.py${pargs:+ $pargs})"
+  run rm -rf "$pack"
+  # shellcheck disable=SC2086   # pargs: zero or one option
+  ps_cli "$py" tools/iq_pack.py --gguf "${g:-<first GGUF shard under $(mdir "$m" polystrata)>}" --out "$pack" $pargs
+  [ "$DRY" = 1 ] || ps_pack_want "$m" "$g" > "$pack/.spark-llm-pack"
+}
+
+# PolyStrata's name for the model's set, f"qwen3.8-flash-next-{quant}" as setup.py writes it: its drafter logic keys on it.
+ps_set_name(){ case "$1" in flashnext-abl) echo qwen3.8-flash-next-iq3_xxs;; *) echo qwen3.8-flash-next-iq3_s;; esac; }   # $1 model
+
+# The run config of a Flash-Next model (JSON), written from one template for both rows so they differ only in their files.
+# The arguments are the ones PolyStrata's setup writes on a DGX Spark (unified memory, 122 GB of RAM: --mmap-experts, --ple-io ram,
+# --prefill auto:32768; --kv-resident from a 64K context, setup.py kv_streaming_wanted), without the MTP layer's options: the server
+# replaces them with DFlash2's anyway. Two settings make serve/server.py's drafting step (strata_control/drafting.py apply) start
+# DFlash2 with the drafter installed here, for either model:
+#   model_name  PolyStrata's set name. A name it does not know sends it to the GGUF header, and its header reader stops at the
+#               string array OrcaRouter's file has first (general.tags): the file then counts as "another Flash-Next size" and
+#               starts with no drafter. The served name is an alias (#297), so clients use it as with every other engine.
+#   user_args   --draft-model, the tuned drafter: without it a set with no drafter of its own in PolyStrata's table (IQ3_XXS
+#               on CUDA) looks for the stock pack, which is not downloaded, and starts with no drafter.
+# lib_dirs: the CUDA wheels, as setup.py engine_lib_dirs gives this engine (its BUILD.json names no library folders).
+# $1 write|preview, $2 model, $3 config path. preview prints the JSON and writes nothing (--dry-run).
+ps_strata_json(){
+  local mode=$1 m=$2 cfg=$3 g esp=""; g=$(first_gguf "$(mdir "$m" polystrata)")
+  if [ "$(ps_projection "$m")" = on ]; then esp=$PS_PROJECTION_FILE; fi
+  ( cd "$PS_DIR/terminal" && "$(ps_py)" -B - "$mode" "$cfg" "$PS_DIR/terminal" "$PS_STORE" "$PS_DATA" "${g:-<first GGUF shard>}" \
+      "$(ps_ple_gguf "$m" "${g:-<first GGUF shard>}")" "$(ps_pack_dir "$m")" "$CTX" "$(ps_set_name "$m")" "$(served "$m" polystrata)" \
+      "$BASE/logs/polystrata-$m.log" "$esp" <<'PY'
+import json, site, sys
+from pathlib import Path
+mode, cfg, terminal, store, data, shard1, ple, pack, ctx, name, alias, log, esp = sys.argv[1:]
+sys.path.insert(0, terminal)
+from strata_control import drafting, engine_component as ec
+try:   # the installed engine package; a start checks every file against the package's manifest
+    eng = ec.resolve(Path(store), backend="cuda", full=(mode == "write"))
+except Exception as exc:
+    sys.exit(f"no usable Strata engine in {store}: {exc} (run --install again)")
+drafter = drafting.tuned_path(data)
+if mode == "write" and not drafting.tuned_ok(data):   # the pinned size and SHA-256
+    sys.exit(f"the DFlash2 drafter {drafter} is missing or not the pinned file (run --install again)")
+lib_dirs = []
+for sp in site.getsitepackages():
+    nv = Path(sp) / "nvidia"
+    for hit in sorted(nv.rglob("libcublas.so.13*")) if nv.is_dir() else []:
+        if str(hit.parent) not in lib_dirs:
+            lib_dirs.append(str(hit.parent))
+args = ["--pack", pack, "--native", shard1, "--ple-gguf", ple,
+        "--expert-profile", f"{terminal}/data/expert-profile.bin", "--expert-cache", "auto",
+        "--prefill", "auto:32768", "--max-context", ctx, "--kv", "int8", "--mmap-experts", "--ple-io", "ram"]
+if int(ctx) >= 65536:
+    args += ["--kv-resident", "32768"]
+if esp:   # strata_control/setup_config.py: the package's profile, llama.cpp's flags
+    args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
+             "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+text = json.dumps({"exe": str(eng.exe), "args": args, "user_args": ["--draft-model", str(drafter)], "cwd": terminal,
+                   "tokenizer": f"{pack}/tokenizer", "model_name": name, "aliases": [alias], "log": log, "lib_dirs": lib_dirs}, indent=1)
+if mode == "write":
+    Path(cfg).write_text(text + "\n", encoding="utf-8")
+else:
+    print(text)
+PY
+  )
+}
+
+ps_engine_version(){   # $1 run config -> the version in its engine's BUILD.json (empty when unknown)
+  python3 - "$1" <<'PY' 2>/dev/null || true
+import json, sys
+from pathlib import Path
+exe = Path(json.load(open(sys.argv[1]))["exe"])
+print(json.loads((exe.parent / "BUILD.json").read_text()).get("version", ""))
+PY
+}
+
+ps_strata_config(){   # $1 model -> prints ONLY the path of its run config; messages go to stderr
+  local m=$1 g cfg; g=$(first_gguf "$(mdir "$m" polystrata)"); cfg="$PS_DATA/strata-$m.json"
+  [ -n "$g" ] || die "no GGUF under $(mdir "$m" polystrata)"
+  ps_strata_json write "$m" "$cfg" >&2 || die "could not write the PolyStrata run config of $m"
+  echo "$cfg"
+}
+
+ps_config(){   # $1 model -> prints ONLY the path of its PolyStrata run config; messages go to stderr
+  case "$(ps_kind "$1")" in strata) ps_strata_config "$1" ;; *) ps_poly_config "$1" ;; esac
+}
+
+ps_poly_config(){   # $1 model -> prints ONLY the path of its strata-poly run config (tokenizer pack + JSON); messages go to stderr
   local m=$1 g pack cfg; g=$(first_gguf "$(mdir "$m" polystrata)")
   [ -n "$g" ] || die "no GGUF under $(mdir "$m" polystrata)"
   pack="$PS_DATA/packs/$m"; cfg="$PS_DATA/strata-$m.json"; mkdir -p "$pack"
@@ -236,9 +414,19 @@ PY
 }
 
 ps_start(){   # $1 model, $2 run config from ps_config
-  local m=$1 cfg=${2:-} key
-  [ "$DRY" = 1 ] && { say "(dry run: would start PolyStrata for $m on $BIND:$PORT)"; return; }
-  say "Starting $(field "$m" polystrata 3) on PolyStrata (strata-poly, ${CTX} ctx)"
+  local m=$1 cfg=${2:-} key prog=strata-poly
+  if [ "$(ps_kind "$m")" = strata ]; then prog="Strata engine + DFlash2, refusal projection $(ps_projection "$m")"; fi
+  if [ "$DRY" = 1 ]; then
+    say "(dry run: would start PolyStrata for $m on $BIND:$PORT)"
+    if [ "$(ps_kind "$m")" = strata ]; then
+      say "(dry run: on the $prog)"
+      if [ -x "$(ps_py)" ] && ps_engine_installed; then
+        say "(dry run: the run config it would write to $PS_DATA/strata-$m.json:)"; ps_strata_json preview "$m" -
+      else say "(dry run: no run config to show: PolyStrata or its Strata engine is not installed under $PS_DIR)"; fi
+    fi
+    return
+  fi
+  say "Starting $(field "$m" polystrata 3) on PolyStrata ($prog, ${CTX} ctx)"
   key=$(api_key)
   # The key goes in through the environment: serve/server.py's --api-key defaults to $STRATA_API_KEY. Not argv.
   ( cd "$PS_DIR/terminal" || die "missing $PS_DIR/terminal (run --install $m --engine polystrata)"
@@ -419,24 +607,40 @@ set_model_args(){   # $1 engine, $2 model -> MODEL_ARGS: the flags that depend o
     vllm:qwen27b*) MODEL_ARGS=(--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder) ;;
     # CyberTiel's GGUF carries an MTP draft head; its recommended sampling
     llamacpp:cybertiel*) MODEL_ARGS=(--spec-type draft-mtp --temp 0.6 --top-p 0.95 --top-k 40 --min-p 0.05) ;;
+    # Flash-Next: the weights are read into memory, not mapped (this llama.cpp build refuses --no-mmap and takes --load-mode none)
+    llamacpp:flashnext) MODEL_ARGS=(--load-mode none) ;;
+    llamacpp:flashnext-abl)
+      MODEL_ARGS=(--load-mode none)
+      # OrcaRouter's separate MTP draft model, with the draft depth its model card recommends
+      if [ "$LLAMA_ABL_MTP" = on ]; then
+        MODEL_ARGS+=(-md "/models/$FN_ABL_DRAFT" -ngld 99 --spec-type draft-mtp --spec-draft-n-max 3); fi ;;
     polystrata:*|tensorfold:*) MODEL_ARGS=() ;;
     *) die "no $1 settings for model '$2': add them to set_model_args" ;;
   esac
 }
 
 missing_for(){   # $1 model, $2 engine -> prints what a start needs but is not there, one item per line (nothing = runnable)
-  local m=$1 e=$2 d; d=$(mdir "$m" "$e")
+  local m=$1 e=$2 d g; d=$(mdir "$m" "$e")
   case "$e" in
     vllm)
       [ -s "$d/config.json" ] || echo "weights ($d)"
       docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1 || echo "image $VLLM_IMAGE"
       if [[ "$VLLM_SPEC" == *dflash* ]] && [ ! -s "$(drafter_27b)/config.json" ]; then echo "DFlash2 drafter ($(drafter_27b))"; fi ;;
     llamacpp)
-      [ -n "$(first_gguf "$d")" ] || echo "GGUF weights ($d)"
+      g=$(first_gguf "$d"); if [ -n "$g" ]; then missing_shards "$g"; else echo "GGUF weights ($d)"; fi
+      if [ "$m" = flashnext-abl ] && [ "$LLAMA_ABL_MTP" = on ] && [ ! -s "$d/$FN_ABL_DRAFT" ]; then echo "MTP draft model ($d/$FN_ABL_DRAFT)"; fi
       docker image inspect "$LLAMA_IMAGE" >/dev/null 2>&1 || echo "image $LLAMA_IMAGE" ;;
     polystrata)
-      [ -n "$(first_gguf "$d")" ] || echo "GGUF weights ($d)"
-      [ -x "$PS_DIR/build-poly-spark/strata-poly" ] || echo "the strata-poly build"
+      g=$(first_gguf "$d"); if [ -n "$g" ]; then missing_shards "$g"; else echo "GGUF weights ($d)"; fi
+      if [ "$(ps_kind "$m")" = strata ]; then
+        ps_engine_installed || echo "the Strata engine ($PS_STORE)"
+        ps_cuda_libs || echo "the NVIDIA CUDA libraries in PolyStrata's Python environment"
+        [ -s "$PS_DRAFTER" ] || echo "the DFlash2 drafter ($PS_DRAFTER)"
+        ps_pack_ok "$m" || echo "the PolyStrata pack of $m ($(ps_pack_dir "$m"))"
+        if [ "$(ps_projection "$m")" = on ] && [ ! -s "$PS_PROJECTION_FILE" ]; then echo "the refusal projection ($PS_PROJECTION_FILE)"; fi
+      else
+        [ -x "$PS_DIR/build-poly-spark/strata-poly" ] || echo "the strata-poly build"
+      fi
       [ -x "$PS_DIR/terminal/.venv/bin/python" ] || echo "PolyStrata's Python environment" ;;
     tensorfold)
       [ -s "$(tf_model_path "$m")/config.json" ] || echo "weights ($(tf_model_path "$m"))"
@@ -446,11 +650,21 @@ missing_for(){   # $1 model, $2 engine -> prints what a start needs but is not t
   esac
 }
 
+check_options(){   # $1 model, $2 engine: the switches of one row are on|off, and on only where they do something
+  local v
+  for v in PS_REFUSAL_PROJECTION LLAMA_ABL_MTP; do
+    case "${!v}" in on|off) ;; *) die "$v must be on or off, not '${!v}'" ;; esac
+  done
+  if [ "$PS_REFUSAL_PROJECTION" = on ] && [ "$1:$2" != flashnext:polystrata ]; then
+    die "PS_REFUSAL_PROJECTION=on is for flashnext on polystrata only (the projection was made for the stock model)"; fi
+}
+
 check_runnable(){   # $1 model, $2 engine: dies if a start could not work. Runs BEFORE the serving model is stopped.
+  check_options "$1" "$2"
   local miss; miss=$(missing_for "$1" "$2")
   set_model_args "$2" "$1"
   [ -z "$miss" ] && return 0
-  miss=$(paste -sd';' - <<<"$miss")
+  miss=${miss//$'\n'/; }   # one line, items separated by "; "
   if [ "$DRY" = 1 ]; then say "(dry run: $1 on $2 is not installed yet; missing: $miss)"; return 0; fi
   die "cannot start $1 on $2, missing: $miss (run --install $1 --engine $2)"
 }
@@ -560,8 +774,9 @@ vllm_start(){   # $1 model, $2 container name
 }
 
 llama_start(){   # $1 model, $2 container name
-  local m=$1 name=$2 d f; d=$(mdir "$m" llamacpp); f=$(first_gguf "$d")
-  say "Starting $(field "$m" llamacpp 3) ($(basename "${f:-gguf}")) on llama.cpp (MTP, ${CTX} ctx)"
+  local m=$1 name=$2 d f spec=MTP; d=$(mdir "$m" llamacpp); f=$(first_gguf "$d")
+  case "$m" in flashnext) spec="no drafter" ;; flashnext-abl) if [ "$LLAMA_ABL_MTP" = on ]; then spec="MTP draft model"; else spec="no drafter"; fi ;; esac
+  say "Starting $(field "$m" llamacpp 3) ($(basename "${f:-gguf}")) on llama.cpp ($spec, ${CTX} ctx)"
   # The key file is mounted read-only and read by --api-key-file: the key is not in any argv.
   # shellcheck disable=SC2086   # LLAMA_EXTRA is a list of extra arguments
   run docker run -d --name "$name" --label spark-llm=1 --gpus all -p "$BIND:$PORT:8000" \
@@ -605,9 +820,13 @@ write_active(){   # $1 model, $2 engine, $3 container: .active ("model engine bi
                "vllm_spec=$VLLM_SPEC" "gpu_util=$VLLM_GPU_UTIL" "extra=${VLLM_EXTRA:-${QWEN_EXTRA:-}}"
                "vllm_version=$(kcurl -fs --max-time 5 "http://$(probe_host "$BIND"):$PORT/version" 2>/dev/null || true)") ;;
     llamacpp) kv+=("image=$LLAMA_IMAGE" "image_id=$(docker image inspect -f '{{.Id}}' "$LLAMA_IMAGE" 2>/dev/null || true)"
-                   "gguf=$(basename "$(first_gguf "$(mdir "$m" llamacpp)")")" "extra=${LLAMA_EXTRA:-${TIEL_EXTRA:-}}") ;;
+                   "gguf=$(basename "$(first_gguf "$(mdir "$m" llamacpp)")")" "extra=${LLAMA_EXTRA:-${TIEL_EXTRA:-}}")
+              if [ "$m" = flashnext-abl ]; then kv+=("llama_abl_mtp=$LLAMA_ABL_MTP"); fi ;;
     polystrata) kv+=("ps_repo=$PS_REPO" "ps_ref=$PS_REF" "ps_head=$(git -C "$PS_DIR" rev-parse HEAD 2>/dev/null || true)"
-                     "gguf=$(basename "$(first_gguf "$(mdir "$m" polystrata)")")") ;;
+                     "gguf=$(basename "$(first_gguf "$(mdir "$m" polystrata)")")")
+                if [ "$(ps_kind "$m")" = strata ]; then
+                  kv+=("ps_engine=strata" "ps_engine_version=$(ps_engine_version "$PS_DATA/strata-$m.json")" "drafter=$(basename "$PS_DRAFTER")"
+                       "pack_args=$(ps_pack_args "$m")" "refusal_projection=$(ps_projection "$m")"); fi ;;
     tensorfold) kv+=("tf_version=$TF_VERSION" "tf_sha256=$TF_SHA256" "extra=${TF_EXTRA:-}")
                 if needs_drafter "$m" tensorfold; then kv+=("drafter=$DRAFTER_27B_REPO"); fi ;;
   esac
@@ -660,7 +879,8 @@ speed(){   # $1 mode: speed | parity; $2 cases
   # a run that produced reasoning (streamed or hidden) is flagged and left out of the medians.
   local eb='{"chat_template_kwargs":{"enable_thinking":false}}'
   local st="$SCRIPT_DIR/speedtest.py"; [ -f "$st" ] || die "speedtest.py is missing beside $0"
-  common=(--base-url "$url" --key-file "$KEYFILE" --label "$m-$e" --extra-body "$eb" --meta "$meta")
+  # --model: the served name, not the first entry of /v1/models (PolyStrata's Flash-Next lists its own set name before it)
+  common=(--base-url "$url" --key-file "$KEYFILE" --model "$(served "$m" "$e")" --label "$m-$e" --extra-body "$eb" --meta "$meta")
   make_dirs
   if [ "$1" = parity ]; then
     run python3 "$st" "${common[@]}" --parity --out "$out-parity.json"
@@ -733,7 +953,7 @@ write_env(){   # $1 model, $2 engine, $3 address the server listens on
     hostip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'); hostip=${hostip:-$(hostname -I | awk '{print $1}')}
   else hostip=$3; fi
   case "$1" in   # each model's recommended sampling
-    qwen27b*) extra='{"top_k":20,"top_p":0.95}' ;;
+    qwen27b*|flashnext*) extra='{"top_k":20,"top_p":0.95}' ;;   # both Qwen3.8 models
     cybertiel*) extra='{"top_k":40,"min_p":0.05,"top_p":0.95}' ;;
     *) die "no Cybench sampling settings for '$1': add them to write_env" ;;
   esac
