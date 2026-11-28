@@ -12,3 +12,4 @@ results/
 logs/
 *.gguf
 *.safetensors
+__pycache__/
