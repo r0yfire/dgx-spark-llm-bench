@@ -78,7 +78,8 @@ What these show:
 - Spark-specific settings: `sm_121a` kernels, FlashInfer NVFP4 GEMM, conservative GPU memory use on unified memory
 - Speculative decoding: MTP (vLLM and llama.cpp turn it on with a flag; PolyStrata's `strata-poly` uses the GGUF's MTP head on its own; TensorFold and veloGB10 draft with Qwen3.8-Flash-Next's), DFlash2 (TensorFold for Qwen3.8-27B, and PolyStrata's Strata engine for Qwen3.8-Flash-Next), or DSpark (Strata's DeepSeek engine)
 - Conversation reuse for agents, which send their whole conversation again every turn: PolyStrata keeps conversations by default, blazux's vLLM recipe turns on vLLM's prefix caching, and the script turns on TensorFold's prompt cache and veloGB10's prefix cache for Qwen3.8-Flash-Next (see [Engines](#engines))
-- `--speed` and `--parity` benchmarks of the running model
+- `--speed` and `--parity` benchmarks of the running model, including a multi-turn agent loop (`--speed agentic`)
+- Aider's Polyglot coding benchmark on the running model (`aider-polyglot.sh`)
 - Cybench setup and runs, patched to work with a local endpoint, with per-task result tables
 - Tiered clean-up: stop servers, remove images, delete weights, or remove everything
 - `--dry-run` prints what would happen without changing anything
@@ -148,6 +149,7 @@ CTX=262144 ./spark-llm.sh --start deepseek41       # the stock model, with a sma
 
 ./spark-llm.sh --speed                             # tokens/s of the running model (short, 4k, 16k, 32k cases)
 SPEED_NEEDLE=236000 ./spark-llm.sh --speed 4k      # one prompt size, plus a ~208K-token needle test
+./spark-llm.sh --speed agentic                     # an agent loop growing to ~120K tokens: TTFT and decode per turn
 ./spark-llm.sh --parity                            # greedy answers to fixed prompts, to compare engines
 
 ./spark-llm.sh --cybench-setup                     # clone + patch Cybench, pull its image
@@ -280,8 +282,9 @@ All settings are environment variables with sensible defaults:
 - Token counts come only from the server's own `usage` (`stream_options.include_usage`). A run without `usage` gets no rates (shown as `n/a`, flagged `no_usage`) rather than a count of streamed chunks, which would understate decode for engines that send several drafted tokens per chunk.
 - Runs are flagged, and left out of the medians, when the model produced reasoning even though thinking was turned off: streamed reasoning, a `<think>` tag in the answer, `reasoning_tokens` in `usage`, or more completion tokens than the streamed text can hold, or under 2 characters per token (a heuristic): signs of hidden reasoning, which would make prefill look slow and decode look fast. Flagged runs are printed with a warning and kept in the JSON.
 - `--needle N` checks long context; `--parity` saves greedy answers to fixed prompts; `--table FILES...` prints a markdown table of result files, one row per label and engine configuration.
+- `agentic` measures an agent loop rather than one cold prompt, because an agent (Cybench, a coding assistant) resends a growing conversation every turn. One conversation starts with a fixed system prompt (tool descriptions and a repository map, about 3K tokens) and a task. Each turn, the model answers (up to 256 tokens) and a tool result of nominally 3,500 tokens (tokenizers count 4,000-6,500 for this text) is appended: a directory listing, a source file, a service log, grep hits or a failing test run, in rotation, built from real text. The model's replies stay in the conversation verbatim and the nonce is only at the very start, so each run starts cold but every later request begins with the previous one, and an engine with a prefix cache can skip it. The conversation grows to about 120,000 tokens (`--agentic-target`; Cybench's default input limit here) in 25-30 turns. Each turn records the context size, the time to first token, the cached tokens when the server reports them (`usage.prompt_tokens_details.cached_tokens`), the tokens added since the previous request, the prefill rate of the uncached (or added) part and the decode rate. The summary gives the time to first token and decode at about 8K, 32K, 64K and 120K tokens, the total time, and the mean decode. It is one conversation per run (`--agentic-runs`), greedy with thinking off like the other cases, and its tool results are synthetic. A chat template that renders past replies differently from the generated text (Qwen's empty think block) lets an engine reuse only up to the previous request's prompt, as in real use.
 
-`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`, including the engine configuration the model was started with (`meta`: image and image ID, `VLLM_SPEC`, `CTX`, PolyStrata commit, the Strata engine's version, drafter and engine settings, `PS_REFUSAL_PROJECTION`, `LLAMA_ABL_MTP`, Strata v0.2.13's commit, DeepSeek engine version and arguments, TensorFold version, extra arguments).
+`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`, including the engine configuration the model was started with (`meta`: image and image ID, `VLLM_SPEC`, `CTX`, PolyStrata commit, the Strata engine's version, drafter and engine settings, `PS_REFUSAL_PROJECTION`, `LLAMA_ABL_MTP`, Strata v0.2.13's commit, DeepSeek engine version and arguments, TensorFold version and prompt cache, veloGB10's version and prefix cache, the `vllm-flash` recipe's commit, image ID and settings, extra arguments).
 
 ## Benchmarking with Cybench
 
@@ -324,6 +327,27 @@ Keep these caveats in mind:
 - The subset leaves out pwn and reversing, and it is easier than the full benchmark, so the results can't be compared to published Cybench scores.
 - Each model uses its recommended sampling settings: temperature 0.6 for both, with `top_k` 20 for Qwen and `top_k` 40 plus `min_p` 0.05 for CyberTiel.
 
+## Coding benchmark: Aider Polyglot
+
+`aider-polyglot.sh` runs [Aider](https://github.com/Aider-AI/aider)'s Polyglot benchmark against the model `spark-llm.sh` is serving: 225 Exercism exercises in C++, Go, Java, JavaScript, Python and Rust. The model edits each exercise's files from its instructions; the tests run, and on a failure it sees their output and gets a second try. That edit-test loop is closer to agentic coding than a single-answer benchmark, and the scores (`pass_rate_1`, `pass_rate_2`, the share of well-formed edits) are on the same scale as [Aider's leaderboard](https://aider.chat/docs/leaderboards/).
+
+```bash
+./aider-polyglot.sh --setup        # Aider and the exercises at their pinned commits, and the benchmark image (10-20 min)
+./aider-polyglot.sh --toolchains   # every language's tests once, no model: checks the image on this aarch64 machine
+./aider-polyglot.sh --run          # all 225 exercises on the running model; run it again to continue an interrupted run
+./aider-polyglot.sh --run 20       # 20 exercises, chosen at random by Aider
+AIDER_KEYWORDS=python/exercises/practice/bowling ./aider-polyglot.sh --run   # chosen exercises
+./aider-polyglot.sh --stats        # Aider's report of the latest run
+```
+
+- Pinned: Aider at `5dc9490` (its `main`, which holds the benchmark harness) and the exercises at `7e0611e`. The image is built from that checkout's `benchmark/Dockerfile`, as Aider's benchmark README describes, and the run uses the pinned checkout unmodified.
+- The model is reached as `openai/<served name>` through `OPENAI_API_BASE` at the host's LAN address, as Aider documents for OpenAI-compatible servers. The key goes into the container as an environment variable copied from the script's own environment, never on a command line.
+- Each model uses its recommended sampling, the same as for Cybench (temperature 0.6; for Qwen3.8 `top_p` 0.95 and `top_k` 20), with thinking on, up to 32,768 output tokens and a one-hour request timeout. `AIDER_THINKING=off` and `AIDER_MAX_TOKENS` change that. With thinking on, Qwen3.8-Flash-Next wrote about 25,000 tokens for each first answer in a three-exercise trial on PolyStrata (about 10 minutes per exercise), so all 225 exercises would take well over a day per model; a subset (`--run N`, `AIDER_KEYWORDS`, `AIDER_LANGUAGES`) or thinking off is the practical choice for comparing several models.
+- Edit format `diff`: both Qwen3 entries on Aider's leaderboard used it, Aider's own settings give it to its large Qwen models, and most leaderboard entries use it. `whole` would make the model rewrite entire files and spend far more time decoding.
+- One exercise at a time (`AIDER_THREADS=1`), since the engines here serve one stream at a time, with two tries each (`AIDER_TRIES`).
+- Results go to `$SPARK_LLM_HOME/results/aider-<model>-<engine>-<timestamp>/`: Aider's per-exercise logs and chat histories under `polyglot/`, the model settings used, `run.json` (the server's configuration), `stats.txt` and the total time over all sessions. `--run` continues the latest unfinished run of the same model and engine (Aider skips exercises that already have a result); `AIDER_NEW=1` starts a new one.
+- The tests run model-written code, so everything runs inside Aider's container with its 12 GB memory cap, as upstream requires.
+
 ## Files
 
 ```
@@ -345,7 +369,8 @@ Keep these caveats in mind:
 ├── speed/              # speed and parity results (JSON)
 ├── logs/               # native engines' server logs (veloGB10: velogb10-<model>.log and velogb10-proxy.log)
 ├── cybench/            # patched Cybench checkout (.env holds the key, mode 600)
-└── results/            # per-run Cybench logs and tasks.tsv
+├── aider-bench/        # pinned Aider checkout and the Polyglot exercises (aider-polyglot.sh)
+└── results/            # per-run Cybench logs and tasks.tsv; Aider Polyglot runs (aider-<model>-<engine>-<timestamp>/)
 ```
 
 ## Troubleshooting
