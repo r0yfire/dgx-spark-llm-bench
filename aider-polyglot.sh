@@ -15,14 +15,20 @@
 # Settings (environment):
 #   SPARK_LLM_HOME    where spark-llm.sh keeps its state (default ~/spark-llm): .active, .active.json, .api_key, results/
 #   PORT              the model server's port (default 8000)
+#   AIDER_SUBSET      a file listing the exercises to run, one path per line (# comments allowed), e.g.
+#                     aider-subset-60.txt beside this script: the fixed 60-exercise comparison set, 10 per language
 #   AIDER_KEYWORDS    only exercises whose path contains one of these (comma-separated), e.g. python/exercises/practice/bowling
 #   AIDER_LANGUAGES   only these languages (comma-separated), e.g. python,rust
 #   AIDER_TRIES       attempts per exercise (default 2, as on the leaderboard)
 #   AIDER_THREADS     exercises in parallel (default 1: the engines here serve one stream at a time)
 #   AIDER_EDIT_FORMAT edit format (default diff: see below)
 #   AIDER_NEW=1       start a new run even if an unfinished one exists
-#   AIDER_THINKING    on (default, as for Cybench) or off: Qwen3.8's thinking. On, it writes ~25K tokens per first reply
+#   AIDER_THINKING    on (default, as for Cybench) or off (Inkling 2 Mini: its lowest effort, none). On, Qwen3.8-Flash-Next
+#                     at its default effort writes ~25K tokens per first reply
 #                     on these exercises (about 10 minutes each at ~80 tok/s, so ~38 hours for all 225)
+#   AIDER_EFFORT      reasoning effort, passed as chat_template_kwargs.reasoning_effort (default: unset, the template's own
+#                     default). Qwen3.8: low, medium or xhigh (default xhigh). Inkling 2 Mini: none, minimal, low, medium,
+#                     high, xhigh, max or 0.0-0.99 (default 0.9, "high"). Needs thinking on.
 #   AIDER_MAX_TOKENS  output limit per reply (default 32768)
 #
 # Model settings: the model is reached as openai/<served name> through OPENAI_API_BASE (Aider's documented route for an
@@ -50,7 +56,8 @@ EXERCISES="$WORK/polyglot-benchmark"
 IMAGE="spark-llm-aider-benchmark:${AIDER_REF:0:12}"
 KEYFILE="$BASE/.api_key"; ACTIVE="$BASE/.active"; ACTIVE_META="$BASE/.active.json"
 TRIES="${AIDER_TRIES:-2}"; THREADS="${AIDER_THREADS:-1}"; EDIT_FORMAT="${AIDER_EDIT_FORMAT:-diff}"
-THINKING="${AIDER_THINKING:-on}"; MAX_TOKENS="${AIDER_MAX_TOKENS:-32768}"
+THINKING="${AIDER_THINKING:-on}"; MAX_TOKENS="${AIDER_MAX_TOKENS:-32768}"; EFFORT="${AIDER_EFFORT:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say(){ printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die(){ printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -84,32 +91,70 @@ meta(){   # $1 key -> its value in .active.json (empty when absent)
 }
 
 model_settings(){   # $1 model, $2 served name, $3 file: Aider model settings (YAML) for openai/<served>
-  local sampling think
+  local temp=0.6 top_p=0.95 think x body=() kw=()
   case "$THINKING" in on) think=true ;; off) think=false ;; *) die "AIDER_THINKING must be on or off, not '$THINKING'" ;; esac
   [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "AIDER_MAX_TOKENS must be a number of tokens"
-  case "$1" in   # the same recommended sampling as spark-llm.sh's Cybench runs (write_env), with thinking on or off
-    qwen27b*|flashnext*) sampling="top_p: 0.95
-    extra_body:
-      top_k: 20
-      chat_template_kwargs:
-        enable_thinking: $think" ;;
-    cybertiel*) sampling='top_p: 0.95
-    extra_body:
-      top_k: 40
-      min_p: 0.05' ;;
+  [ -z "$EFFORT" ] || [ "$THINKING" = on ] || die "AIDER_EFFORT sets the effort of thinking: it needs AIDER_THINKING=on"
+  # Each model's recommended sampling, the same as spark-llm.sh's Cybench runs (write_env), and its template's thinking switches
+  case "$1" in
+    qwen27b*|flashnext*)   # Qwen3.8's template: enable_thinking, and reasoning_effort low | medium | xhigh (default xhigh)
+      [ -z "$EFFORT" ] || [[ "$EFFORT" =~ ^(low|medium|xhigh)$ ]] ||
+        die "Qwen3.8's chat template takes reasoning_effort low, medium or xhigh (default xhigh), not '$EFFORT'"
+      body=("top_k: 20"); kw=("enable_thinking: $think")
+      [ -z "$EFFORT" ] || kw+=("reasoning_effort: \"$EFFORT\"") ;;
+    inkling*)   # Inkling 2 Mini's template has no enable_thinking: reasoning_effort none | minimal | low | medium | high |
+                # xhigh | max, or 0.0-0.99 (default 0.9 = high); "none" is its lowest setting (it still reasons a little).
+                # Sampling: its generation_config.json (temperature 1.0); its card and vLLM recipe give no other advice.
+      temp=1.0; top_p=""
+      if [ "$THINKING" = off ]; then kw=('reasoning_effort: "none"')
+      elif [[ "$EFFORT" =~ ^(none|minimal|low|medium|high|xhigh|max)$ ]]; then kw=("reasoning_effort: \"$EFFORT\"")
+      elif [[ "$EFFORT" =~ ^0(\.[0-9]{1,2})?$ ]]; then kw=("reasoning_effort: $EFFORT")
+      elif [ -n "$EFFORT" ]; then die "Inkling 2 Mini's chat template takes reasoning_effort none, minimal, low, medium, high, xhigh, max or 0.0-0.99, not '$EFFORT'"
+      fi ;;
+    cybertiel*)
+      [ -z "$EFFORT" ] || die "CyberTiel's chat template has no reasoning effort setting: unset AIDER_EFFORT"
+      body=("top_k: 40" "min_p: 0.05") ;;
     *) die "no Aider sampling settings for '$1': add them to model_settings in $0" ;;
   esac
-  cat > "$3" <<EOF
-- name: openai/$2
-  edit_format: $EDIT_FORMAT
-  use_repo_map: true
-  use_temperature: 0.6
-  reasoning_tag: think
-  extra_params:
-    max_tokens: $MAX_TOKENS
-    timeout: 3600
-    $sampling
-EOF
+  {
+    printf -- '- name: openai/%s\n  edit_format: %s\n  use_repo_map: true\n  use_temperature: %s\n  reasoning_tag: think\n' \
+      "$2" "$EDIT_FORMAT" "$temp"
+    printf '  extra_params:\n    max_tokens: %s\n    timeout: 3600\n' "$MAX_TOKENS"
+    [ -z "$top_p" ] || printf '    top_p: %s\n' "$top_p"
+    if [ ${#body[@]} -gt 0 ] || [ ${#kw[@]} -gt 0 ]; then
+      printf '    extra_body:\n'
+      for x in "${body[@]}"; do printf '      %s\n' "$x"; done
+      if [ ${#kw[@]} -gt 0 ]; then
+        printf '      chat_template_kwargs:\n'
+        for x in "${kw[@]}"; do printf '        %s\n' "$x"; done
+      fi
+    fi
+  } > "$3"
+}
+
+SUBSET_FILE=""; SUBSET_SHA=""; SUBSET=()
+load_subset(){   # $1 file (as given, or beside this script): SUBSET = its exercise paths, each checked to name exactly one exercise
+  local f=$1
+  [ -f "$f" ] || f="$SCRIPT_DIR/$1"
+  [ -f "$f" ] || die "AIDER_SUBSET: no file '$1' (here or beside $0)"
+  mapfile -t SUBSET < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$f" | grep -v '^$')
+  [ ${#SUBSET[@]} -gt 0 ] || die "AIDER_SUBSET: $f lists no exercises"
+  # Aider selects by substring (--keywords), so every line must be a real exercise path that no other path contains
+  python3 - "$EXERCISES" "${SUBSET[@]}" <<'PY' || die "AIDER_SUBSET: $f does not match the pinned exercises (see above)"
+import glob, os, sys
+root, wanted = sys.argv[1], sys.argv[2:]
+paths = [os.path.relpath(p, root) for p in glob.glob(os.path.join(root, "*", "exercises", "practice", "*")) if os.path.isdir(p)]
+bad = [(w, [p for p in paths if w in p]) for w in wanted]
+bad = [(w, m) for w, m in bad if m != [w]]
+dups = sorted({w for w in wanted if wanted.count(w) > 1})
+for w, m in bad:
+    print(f"  {w}: matches {m or 'no exercise'}")
+for w in dups:
+    print(f"  {w}: listed twice")
+sys.exit(1 if bad or dups else 0)
+PY
+  SUBSET_FILE=$(basename "$f")
+  SUBSET_SHA=$(printf '%s\n' "${SUBSET[@]}" | sha256sum | cut -c1-64)
 }
 
 HOST_IP=""
@@ -123,13 +168,19 @@ host_ip(){   # sets HOST_IP: the address the container uses to reach the model s
   HOST_IP=$b
 }
 
-run_dir(){   # $1 model, $2 engine -> the run directory to use (the latest unfinished one, or a new one)
-  local d
+SETTINGS=""   # JSON of everything that defines a run (set by run): a run is only continued with the same settings
+run_dir(){   # $1 model, $2 engine, $3 served name -> the latest unfinished run with the same served name and settings, or a new one
+  local d i
   if [ "${AIDER_NEW:-0}" != 1 ]; then
-    local runs=("$BASE/results/aider-$1-$2-"*) i   # timestamped names: glob order is age order
+    local runs=("$BASE/results/aider-$1-$2-"*)   # timestamped names: glob order is age order
     for ((i = ${#runs[@]} - 1; i >= 0; i--)); do
       d=${runs[i]}
-      [ -d "$d" ] && [ ! -e "$d/.done" ] && { echo "$d"; return; }
+      [ -d "$d" ] && [ ! -e "$d/.done" ] && [ -s "$d/run.json" ] || continue
+      python3 - "$d/run.json" "$3" "$SETTINGS" <<'PY' && { echo "$d"; return; }
+import json, sys
+r = json.load(open(sys.argv[1]))
+sys.exit(0 if r.get("served") == sys.argv[2] and r.get("settings") == json.loads(sys.argv[3]) else 1)
+PY
     done
   fi
   echo "$BASE/results/aider-$1-$2-$(date +%Y%m%d-%H%M%S)"
@@ -158,32 +209,42 @@ run(){   # $1 number of exercises (empty: all)
   local key; key=$(tr -d '[:space:]' < "$KEYFILE")
   printf 'header = "Authorization: Bearer %s"\n' "$key" | curl -fs -K - --max-time 10 -o /dev/null "$url/models" ||
     die "the model server does not answer at $url"
-  d=$(run_dir "$m" "$e"); mkdir -p "$d"
-  model_settings "$m" "$served" "$d/model-settings.yml"
-  # what this run is, recorded once (a resumed run keeps its first record and checks the model is the same)
-  if [ -s "$d/run.json" ]; then
-    python3 - "$d/run.json" "$m" "$e" "$served" "$THINKING" "$MAX_TOKENS" <<'PY' || die "$d was started on another model or with other settings; set AIDER_NEW=1"
+  # which exercises: a subset file, or keywords / languages / a random N (a subset excludes the others)
+  local expected=225 tmp
+  sel=()
+  if [ -n "${AIDER_SUBSET:-}" ]; then
+    [ -z "${AIDER_KEYWORDS:-}${AIDER_LANGUAGES:-}$n" ] || die "AIDER_SUBSET already chooses the exercises: drop AIDER_KEYWORDS, AIDER_LANGUAGES and N"
+    load_subset "$AIDER_SUBSET"; expected=${#SUBSET[@]}
+    sel+=(--keywords "$(IFS=,; echo "${SUBSET[*]}")")
+  fi
+  [ -z "${AIDER_KEYWORDS:-}" ] || sel+=(--keywords "$AIDER_KEYWORDS")
+  [ -z "${AIDER_LANGUAGES:-}" ] || sel+=(--languages "$AIDER_LANGUAGES")
+  [ -z "$n" ] || sel+=(--num-tests "$n")
+  tmp=$(mktemp); model_settings "$m" "$served" "$tmp"   # validates thinking / effort / max tokens before any directory is made
+  SETTINGS=$(python3 - "$THINKING" "$EFFORT" "$MAX_TOKENS" "$EDIT_FORMAT" "$TRIES" "$SUBSET_FILE" "$SUBSET_SHA" \
+                       "${AIDER_KEYWORDS:-}" "${AIDER_LANGUAGES:-}" "$n" <<'PY'
 import json, sys
-r = json.load(open(sys.argv[1]))
-same = [r["model"], r["engine"], r["served"], r.get("thinking", "on"), str(r.get("max_tokens", 32768))] == sys.argv[2:7]
-sys.exit(0 if same else 1)
+think, effort, maxtok, fmt, tries, sub, subsha, kw, langs, n = sys.argv[1:]
+print(json.dumps({"thinking": think, "reasoning_effort": effort or None, "max_tokens": int(maxtok), "edit_format": fmt,
+                  "tries": int(tries), "subset": sub or None, "subset_sha256": subsha or None, "keywords": kw or None,
+                  "languages": langs or None, "num_tests": int(n) if n else None}, sort_keys=True))
 PY
-  else
-    python3 - "$d/run.json" "$ACTIVE_META" "$m" "$e" "$served" "$AIDER_REF" "$POLYGLOT_REF" "$EDIT_FORMAT" "$TRIES" "$THINKING" "$MAX_TOKENS" <<'PY'
+)
+  d=$(run_dir "$m" "$e" "$served"); mkdir -p "$d"; mv "$tmp" "$d/model-settings.yml"
+  # what this run is, recorded once; a later --run continues it only with the same served name and settings (run_dir)
+  if [ ! -s "$d/run.json" ]; then
+    python3 - "$d/run.json" "$ACTIVE_META" "$m" "$e" "$served" "$AIDER_REF" "$POLYGLOT_REF" "$SETTINGS" <<'PY'
 import json, sys, time
-f, meta, m, e, served, aref, pref, fmt, tries, think, maxtok = sys.argv[1:]
-json.dump({"model": m, "engine": e, "served": served, "aider_ref": aref, "polyglot_ref": pref, "edit_format": fmt,
-           "tries": int(tries), "thinking": think, "max_tokens": int(maxtok),
-           "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "server": json.load(open(meta))},
+f, meta, m, e, served, aref, pref, settings = sys.argv[1:]
+json.dump({"model": m, "engine": e, "served": served, "aider_ref": aref, "polyglot_ref": pref,
+           "settings": json.loads(settings), "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "server": json.load(open(meta))},
           open(f, "w"), indent=1)
 PY
   fi
-  sel=(); [ -z "${AIDER_KEYWORDS:-}" ] || sel+=(--keywords "$AIDER_KEYWORDS")
-  [ -z "${AIDER_LANGUAGES:-}" ] || sel+=(--languages "$AIDER_LANGUAGES")
-  [ -z "$n" ] || sel+=(--num-tests "$n")
   args=(--model "openai/$served" --edit-format "$EDIT_FORMAT" --threads "$THREADS" --tries "$TRIES"
         --read-model-settings /out/model-settings.yml --exercises-dir polyglot-benchmark "${sel[@]}")
-  say "Aider Polyglot: $m ($e) as openai/$served, edit format $EDIT_FORMAT, thinking $THINKING, $TRIES tries, $THREADS thread(s)" \
+  say "Aider Polyglot: $m ($e) as openai/$served, edit format $EDIT_FORMAT, thinking $THINKING${EFFORT:+ (effort $EFFORT)}," \
+      "${SUBSET_FILE:+subset $SUBSET_FILE ($expected exercises), }$TRIES tries, $THREADS thread(s)" \
       "-> $d ($(count_results "$d") exercises already done)"
   local t0 rc st; t0=$(date +%s)
   # progress: Aider prints its running totals after every exercise
@@ -194,7 +255,7 @@ PY
   echo "$(( $(date +%s) - t0 ))" >> "$d/elapsed_s"
   report "$d"
   [ "$rc" = 0 ] || die "benchmark.py exited with $rc (see $d/benchmark.log); run --run again to continue"
-  if [ -z "$n" ] && [ -z "${AIDER_KEYWORDS:-}${AIDER_LANGUAGES:-}" ] && [ "$(count_results "$d")" -ge 225 ]; then touch "$d/.done"; fi
+  if [ -z "$n" ] && [ -z "${AIDER_KEYWORDS:-}${AIDER_LANGUAGES:-}" ] && [ "$(count_results "$d")" -ge "$expected" ]; then touch "$d/.done"; fi
 }
 
 report(){   # $1 results dir: Aider's own stats, then the total wall time over every session of the run
