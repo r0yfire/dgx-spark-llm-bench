@@ -57,8 +57,9 @@ PS_DRAFTER="$PS_DATA/dflash2/qwen3.8-flash-next-dflash2.strata1.q4_0-selq4.pack"
 # EXPERIMENTAL, stock Flash-Next on PolyStrata only: PolyStrata's refusal-direction projection (setup's --experimental-speed-projection on)
 PS_REFUSAL_PROJECTION="${PS_REFUSAL_PROJECTION:-off}"
 PS_PROJECTION_FILE="$PS_DIR/terminal/data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
-# llama.cpp, flashnext-abl only: also draft with OrcaRouter's separate MTP draft model (-md). Not measured on the Spark yet: off by default.
-LLAMA_ABL_MTP="${LLAMA_ABL_MTP:-off}"
+# llama.cpp, flashnext-abl only: also draft with OrcaRouter's separate MTP draft model (-md). On by default: on the Spark it
+# decoded about 49% faster for 6-7% slower prompt reading (README, Results). off: no drafter.
+LLAMA_ABL_MTP="${LLAMA_ABL_MTP:-on}"
 FN_ABL_DRAFT="Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf"
 KEYFILE="$BASE/.api_key"; ACTIVE="$BASE/.active"; ACTIVE_META="$BASE/.active.json"
 YES=0; DRY=0
@@ -315,8 +316,14 @@ ps_strata_install(){   # $1 model: the CUDA libraries, the engine, the drafter a
 
 # PolyStrata's name for the model's set, f"qwen3.8-flash-next-{quant}" as setup.py writes it: its drafter logic keys on it.
 ps_set_name(){ case "$1" in flashnext-abl) echo qwen3.8-flash-next-iq3_xxs;; *) echo qwen3.8-flash-next-iq3_s;; esac; }   # $1 model
+# Engine settings per model (the run config's "env"). OrcaRouter's GGUF carries its hyper-connection projections as Q8_0, so
+# the engine turns its STRATA_HC_Q8 read on by itself (data/settings-register.json); on the GB10 the first verify window of
+# that path fails ("operation not supported on global/shared address space") and the engine exits on the first request.
+# The pack holds BF16 copies of those projections (--compat-bf16), the path the stock GSQ-RCO file takes: keep to it.
+ps_engine_env(){ case "$1" in flashnext-abl) echo "STRATA_HC_Q8=0";; *) echo "";; esac; }   # $1 model -> NAME=VALUE ...
 
-# The run config of a Flash-Next model (JSON), written from one template for both rows so they differ only in their files.
+# The run config of a Flash-Next model (JSON), written from one template for both rows so they differ only in their files and
+# their engine settings (ps_engine_env).
 # The arguments are the ones PolyStrata's setup writes on a DGX Spark (unified memory, 122 GB of RAM: --mmap-experts, --ple-io ram,
 # --prefill auto:32768; --kv-resident from a 64K context, setup.py kv_streaming_wanted), without the MTP layer's options: the server
 # replaces them with DFlash2's anyway. Two settings make serve/server.py's drafting step (strata_control/drafting.py apply) start
@@ -333,10 +340,10 @@ ps_strata_json(){
   if [ "$(ps_projection "$m")" = on ]; then esp=$PS_PROJECTION_FILE; fi
   ( cd "$PS_DIR/terminal" && "$(ps_py)" -B - "$mode" "$cfg" "$PS_DIR/terminal" "$PS_STORE" "$PS_DATA" "${g:-<first GGUF shard>}" \
       "$(ps_ple_gguf "$m" "${g:-<first GGUF shard>}")" "$(ps_pack_dir "$m")" "$CTX" "$(ps_set_name "$m")" "$(served "$m" polystrata)" \
-      "$BASE/logs/polystrata-$m.log" "$esp" <<'PY'
+      "$BASE/logs/polystrata-$m.log" "$esp" "$(ps_engine_env "$m")" <<'PY'
 import json, site, sys
 from pathlib import Path
-mode, cfg, terminal, store, data, shard1, ple, pack, ctx, name, alias, log, esp = sys.argv[1:]
+mode, cfg, terminal, store, data, shard1, ple, pack, ctx, name, alias, log, esp, envs = sys.argv[1:]
 sys.path.insert(0, terminal)
 from strata_control import drafting, engine_component as ec
 try:   # the installed engine package; a start checks every file against the package's manifest
@@ -360,8 +367,11 @@ if int(ctx) >= 65536:
 if esp:   # strata_control/setup_config.py: the package's profile, llama.cpp's flags
     args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
              "--cvec-mode", "project", "--cvec-dir", "per-layer"]
-text = json.dumps({"exe": str(eng.exe), "args": args, "user_args": ["--draft-model", str(drafter)], "cwd": terminal,
-                   "tokenizer": f"{pack}/tokenizer", "model_name": name, "aliases": [alias], "log": log, "lib_dirs": lib_dirs}, indent=1)
+conf = {"exe": str(eng.exe), "args": args, "user_args": ["--draft-model", str(drafter)], "cwd": terminal,
+        "tokenizer": f"{pack}/tokenizer", "model_name": name, "aliases": [alias], "log": log, "lib_dirs": lib_dirs}
+if envs:   # serve/server.py passes these to the engine
+    conf["env"] = dict(p.split("=", 1) for p in envs.split())
+text = json.dumps(conf, indent=1)
 if mode == "write":
     Path(cfg).write_text(text + "\n", encoding="utf-8")
 else:
@@ -826,7 +836,7 @@ write_active(){   # $1 model, $2 engine, $3 container: .active ("model engine bi
                      "gguf=$(basename "$(first_gguf "$(mdir "$m" polystrata)")")")
                 if [ "$(ps_kind "$m")" = strata ]; then
                   kv+=("ps_engine=strata" "ps_engine_version=$(ps_engine_version "$PS_DATA/strata-$m.json")" "drafter=$(basename "$PS_DRAFTER")"
-                       "pack_args=$(ps_pack_args "$m")" "refusal_projection=$(ps_projection "$m")"); fi ;;
+                       "pack_args=$(ps_pack_args "$m")" "engine_env=$(ps_engine_env "$m")" "refusal_projection=$(ps_projection "$m")"); fi ;;
     tensorfold) kv+=("tf_version=$TF_VERSION" "tf_sha256=$TF_SHA256" "extra=${TF_EXTRA:-}")
                 if needs_drafter "$m" tensorfold; then kv+=("drafter=$DRAFTER_27B_REPO"); fi ;;
   esac

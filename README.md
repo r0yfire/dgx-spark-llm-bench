@@ -14,7 +14,7 @@ One script to install, serve, benchmark and clean up abliterated ("uncensored") 
 | `qwen27b-abl`: [Qwen3.8-27B Uncensored](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | `tensorfold` ([MLX 4-bit](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX)), `vllm` ([NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4)) | Dense 27B hybrid model. TensorFold drafts with [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2); vLLM with the model's MTP head. The NVFP4 repo is gated. |
 | `cybertiel`, `cybertiel-q8`: [CyberTiel Coder 35B-A3B](https://huggingface.co/peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP) | `polystrata`, `llamacpp` | MoE with 3B active parameters, GGUF `UD-Q4_K_XL` or `UD-Q8_K_XL`, MTP draft head in the file. |
 | `flashnext`: [Qwen3.8-Flash-Next](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (stock) | `polystrata`, `llamacpp` | The original model, as the baseline for the abliterated one: ISTA-DASLab's GSQ-RCO `IQ3_S` GGUF (two shards, about 84 GB) at the revision PolyStrata pins. PolyStrata drafts with DFlash2; llama.cpp runs without a drafter. PolyStrata can add its experimental refusal-direction projection (`PS_REFUSAL_PROJECTION=on`). |
-| `flashnext-abl`: [Qwen3.8-Flash-Next Uncensored](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) | `polystrata`, `llamacpp` | OrcaRouter's `IQ3_XXS` GGUF (two shards, 85.2 GB). PolyStrata drafts with the same DFlash2 drafter as the stock model; llama.cpp can draft with OrcaRouter's separate MTP draft model (`LLAMA_ABL_MTP=on`). The repo is gated. |
+| `flashnext-abl`: [Qwen3.8-Flash-Next Uncensored](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) | `polystrata`, `llamacpp` | OrcaRouter's `IQ3_XXS` GGUF (two shards, 85.2 GB). PolyStrata drafts with the same DFlash2 drafter as the stock model; llama.cpp drafts with OrcaRouter's separate MTP draft model (`LLAMA_ABL_MTP=off` turns it off). The repo is gated. |
 
 Every model is served with a 262,144-token context window behind an OpenAI-compatible API on port `8000`, protected by a randomly generated API key that every inference route requires (the script checks this at each start). Only one model runs at a time.
 
@@ -25,7 +25,7 @@ The script also measures tokens per second (prefill and decode) on the running m
 
 ## Results
 
-Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: every engine gets the same prompts through the same streaming client, temperature 0, 512-token answers, thinking off, 3 runs per cell, medians. Prefill is prompt tokens divided by time to first token; decode is the answer's tokens minus one (`completion_tokens - 1`, as reported by the server) divided by the time from the first streamed token to the last. The prompt cases are named by nominal size (`4k`, `16k`, `32k`); the prompts the engines actually counted were about 3,860-4,050 tokens (4k), 14,250-14,430 (16k) and 27,770-27,950 (32k), depending on the model's tokenizer. The needle test hides a code at one third of a ~208,600-token prompt and asks for it back.
+Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: every engine gets the same prompts through the same streaming client, temperature 0, 512-token answers, thinking off, 3 runs per cell, medians. Prefill is prompt tokens divided by time to first token; decode is the answer's tokens minus one (`completion_tokens - 1`, as reported by the server) divided by the time from the first streamed token to the last. The prompt cases are named by nominal size (`4k`, `16k`, `32k`); the prompts the engines actually counted were about 3,860-4,050 tokens (4k), 14,240-14,430 (16k) and 27,760-27,950 (32k), depending on the model's tokenizer. The needle test hides a code at one third of a ~208,600-token prompt and asks for it back.
 
 | Model | Engine | Decode tok/s (4k / 16k / 32k case) | Prefill tok/s (4k / 16k / 32k case) | ~208K needle |
 |---|---|---|---|---|
@@ -34,11 +34,21 @@ Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: ev
 | Qwen3.8-27B Uncensored | **TensorFold**, MLX 4-bit + DFlash2 | **59.1 / 58.4 / 54.2** | 1,414 / 1,349 / 1,316 | found, **253 s** |
 | CyberTiel 35B-A3B Q4_K_XL | llama.cpp, MTP | 84.5 / 80.2 / 74.4 | 2,300 / 2,281 / 2,172 | found, 144 s |
 | CyberTiel 35B-A3B Q4_K_XL | **PolyStrata**, MTP | **97.2 / 87.6 / 85.9** | **3,648 / 3,583 / 3,491** | found, **100 s** |
+| Qwen3.8-Flash-Next (stock) IQ3_S | llama.cpp, no drafter | 31.2 / 30.8 / 30.0 | 858 / 848 / 817 | found, 276 s |
+| Qwen3.8-Flash-Next (stock) IQ3_S | **PolyStrata**, DFlash2 | **63.3 / 61.7 / 62.3** | **1,477 / 1,857 / 1,992** | found, **111 s** |
+| Qwen3.8-Flash-Next (stock) IQ3_S | PolyStrata, DFlash2 + refusal projection | 60.2 / 59.9 / 60.4 | 1,431 / 1,787 / 1,904 | found, 116 s |
+| Qwen3.8-Flash-Next Uncensored IQ3_XXS | llama.cpp, no drafter (`LLAMA_ABL_MTP=off`) | 41.0 / 40.2 / 39.3 | 841 / 837 / 800 | found, 281 s |
+| Qwen3.8-Flash-Next Uncensored IQ3_XXS | llama.cpp, MTP draft model | 61.3 / 59.8 / 58.2 | 784 / 787 / 753 | found, 308 s |
+| Qwen3.8-Flash-Next Uncensored IQ3_XXS | **PolyStrata**, DFlash2 | **67.4 / 65.1 / 64.6** | **1,573 / 1,931 / 2,063** | found, **108 s** |
 
 What these show:
 
 - **Qwen3.8-27B:** TensorFold decodes about 3 times as fast as vLLM. vLLM reads prompts faster in the 4k to 32k cases, and at ~208K the two are level. vLLM's best setting is 4 MTP drafts: 6 drafts and a 16K prefill batch measured no better (prefill in the 16k and 32k cases got slower with the larger batch). TensorFold with an FP8 KV cache decoded slower (50–53 tok/s) than with the default cache.
 - **CyberTiel:** PolyStrata decodes 9-15% faster than llama.cpp (15% in the 4k case, 9% at 16k, 15% at 32k) and reads prompts about 60% faster, on the same GGUF file. Greedy answers to 5 fixed prompts (`--parity`) were identical on 3; the other 2 parted at a near-tie token after 65 and 160 characters, both still correct. PolyStrata's own docs note its fused kernels round slightly differently from llama.cpp's.
+- **Qwen3.8-Flash-Next:** PolyStrata is the fastest engine for both models. It decodes about twice as fast as llama.cpp without a drafter (2.0 times for the stock model, 1.6 times for the abliterated one) and 9-11% faster than llama.cpp with OrcaRouter's MTP draft model. It reads prompts 1.7 to 2.7 times as fast (the gap grows with the prompt) and answers the ~208K needle in under 2 minutes, against 4.6 to 5.1 minutes on llama.cpp. On the same file, its greedy answers to the 5 `--parity` prompts matched llama.cpp's on 4; the fifth parted after 111 characters (abliterated) and 213 (stock).
+- **OrcaRouter's MTP draft model on llama.cpp** (`flashnext-abl`): about 49% faster decoding, 6-7% slower prompt reading (the ~208K needle's first token came 10% later). The script turns it on by default.
+- **PolyStrata's refusal-direction projection** (stock Flash-Next) costs 3-5% of decode and 3-4% of prefill speed.
+- The stock and abliterated Flash-Next files are different quantizations (ISTA-DASLab's GSQ-RCO `IQ3_S`, OrcaRouter's `IQ3_XXS`), so the speed difference between those two models does not measure abliteration.
 - The two Qwen3.8-27B engines read different 4-bit formats of the same OrcaRouter weights (MLX affine 4-bit for TensorFold, NVFP4 for vLLM), so their answers are not expected to match token for token.
 - Single runs on one machine; expect a few percent of variation between sessions.
 
@@ -101,7 +111,7 @@ The first start can take several minutes while weights load and kernels compile.
 ./spark-llm.sh --install flashnext-abl             # Qwen3.8-Flash-Next Uncensored on PolyStrata (its default)
 ./spark-llm.sh --start flashnext-abl
 ./spark-llm.sh --start flashnext-abl --engine llamacpp
-LLAMA_ABL_MTP=on ./spark-llm.sh --start flashnext-abl --engine llamacpp   # also draft with OrcaRouter's MTP draft model
+LLAMA_ABL_MTP=off ./spark-llm.sh --start flashnext-abl --engine llamacpp  # without OrcaRouter's MTP draft model
 ./spark-llm.sh --start flashnext                   # the stock model, on PolyStrata
 PS_REFUSAL_PROJECTION=on ./spark-llm.sh --start flashnext   # the same, with PolyStrata's experimental refusal projection
 ./spark-llm.sh --status
@@ -150,15 +160,16 @@ PolyStrata's own `setup.sh` installs Qwen3.8-Flash-Next together with the stock 
 - **The engine:** `strata update --no-control` from the checkout, into `polystrata/terminal/engine-feed` (the step `setup.sh` runs on a Spark). It installs the signed `linux-aarch64` CUDA package from the update feed of the pinned checkout's release; nothing is compiled. The script also installs the cuBLAS and CUDA runtime wheels `setup.sh` installs for this engine, at its pinned versions.
 - **The drafter:** `strata drafting fetch`, PolyStrata's tuned DFlash2 drafter for Qwen3.8-Flash-Next (about 0.34 GB, its size and SHA-256 pinned by PolyStrata).
 - **The pack:** `tools/iq_pack.py` turns the GGUF's first shard into the pack the engine reads, in `polystrata-data/packs/<model>`. OrcaRouter's file is packed with `--compat-bf16`, as PolyStrata's `docs/ORCA.md` describes: its quantized hyper-connection, attention and PLE projections become the BF16 that PolyStrata's kernels read.
-- **The run config** (`polystrata-data/strata-<model>.json`) is written at each start from one template for both models, so they differ only in their files: the engine arguments `setup.sh` writes on a Spark, without the MTP layer's options. OrcaRouter's PLE table is in its first shard, so that shard is both `--native` and `--ple-gguf`; for the stock files it is the second shard. Two settings make PolyStrata's server start DFlash2 with the installed drafter for either model, with its own window and confidence:
+- **The run config** (`polystrata-data/strata-<model>.json`) is written at each start from one template for both models, so they differ only in their files and one engine setting: the engine arguments `setup.sh` writes on a Spark, without the MTP layer's options. OrcaRouter's PLE table is in its first shard, so that shard is both `--native` and `--ple-gguf`; for the stock files it is the second shard. Two settings make PolyStrata's server start DFlash2 with the installed drafter for either model, with its own window and confidence:
   - `model_name` is PolyStrata's name for the set (`qwen3.8-flash-next-iq3_s`, `qwen3.8-flash-next-iq3_xxs`), and the served name is an alias of it, so clients use the served name as with every engine (`/v1/models` lists both). PolyStrata decides which drafter a model gets from that name; for a name it does not know it reads the GGUF header, and its header reader stops at the list of tags at the top of OrcaRouter's file, so it would start that file with no drafter.
   - `user_args` names the drafter (`--draft-model`). Without it, a set with no drafter of its own in PolyStrata's table (`IQ3_XXS` on CUDA) would look for the stock (untuned) DFlash2 pack, which is not downloaded, and start with no drafter.
+  - `env` (OrcaRouter's file only) sets `STRATA_HC_Q8=0`. That file stores its hyper-connection projections as Q8_0, so the engine switches on its Q8_0 read of them by itself. On the GB10 that read fails in the engine's first verify window (`operation not supported on global/shared address space`), and the engine exits on the first request. With the setting, the engine reads the pack's BF16 copies instead, as it does for the stock file.
 
 `--dry-run --start flashnext` (or `flashnext-abl`) prints the run config a start would write, once the engine is installed. `PS_REFUSAL_PROJECTION=on` adds PolyStrata's experimental refusal-direction projection to the stock model (`flashnext`): a control vector shipped in the checkout, projected out of layers 4-44 (the flags `setup.sh --experimental-speed-projection on` writes). A request can switch it off with `"experimental_speed_projection": false`. Read `polystrata/terminal/data/experimental-speed-projection/README.md` before using it.
 
 ### llama.cpp
 
-CyberTiel drafts with the MTP head in its GGUF (`--spec-type draft-mtp`). Qwen3.8-Flash-Next is loaded into memory with `--load-mode none` (this llama.cpp build refuses `--no-mmap`) and runs without a drafter. For `flashnext-abl`, `LLAMA_ABL_MTP=on` adds OrcaRouter's separate MTP draft model (`-md`, with the `--spec-draft-n-max 3` its model card recommends); `--install flashnext-abl --engine llamacpp` downloads it (4.1 GB) either way.
+CyberTiel drafts with the MTP head in its GGUF (`--spec-type draft-mtp`). Both Qwen3.8-Flash-Next models are loaded into memory with `--load-mode none` (this llama.cpp build refuses `--no-mmap`). The stock model (`flashnext`) runs without a drafter; `flashnext-abl` drafts with OrcaRouter's separate MTP draft model (`-md`, with the `--spec-draft-n-max 3` its model card recommends): on the Spark it decoded about 49% faster, for prompt reading 6-7% slower (see Results). `LLAMA_ABL_MTP=off` runs it without the draft model; `--install flashnext-abl --engine llamacpp` downloads the draft model (4.1 GB) either way.
 
 ### TensorFold
 
@@ -184,7 +195,7 @@ All settings are environment variables with sensible defaults:
 | `LLAMA_IMAGE` | `ghcr.io/ggml-org/llama.cpp:server-cuda13` | llama.cpp server image |
 | `PS_REPO` / `PS_REF` | our fork / a pinned commit | PolyStrata source to build (and, for Qwen3.8-Flash-Next, the release whose engine and drafter it installs) |
 | `PS_REFUSAL_PROJECTION` | `off` | `on`: PolyStrata's experimental refusal-direction projection on the stock Qwen3.8-Flash-Next (`flashnext` on `polystrata` only) |
-| `LLAMA_ABL_MTP` | `off` | `on`: llama.cpp also drafts with OrcaRouter's MTP draft model (`flashnext-abl` on `llamacpp` only) |
+| `LLAMA_ABL_MTP` | `on` | llama.cpp drafts with OrcaRouter's MTP draft model (`flashnext-abl` on `llamacpp` only); `off`: no drafter |
 | `TF_VERSION` / `TF_SHA256` | `1.3.6` / that release's tarball hash | TensorFold release, and the SHA-256 its tarball must match. Another version needs its own `TF_SHA256`. |
 | `DRAFTER_27B_REPO` | `z-lab/Qwen3.8-27B-DFlash2` | DFlash2 drafter for Qwen3.8-27B |
 | `VLLM_EXTRA` / `LLAMA_EXTRA` / `TF_EXTRA` | – | Extra arguments for vLLM, llama.cpp or TensorFold (`QWEN_EXTRA` / `TIEL_EXTRA` still work) |
@@ -204,7 +215,7 @@ All settings are environment variables with sensible defaults:
 - Runs are flagged, and left out of the medians, when the model produced reasoning even though thinking was turned off: streamed reasoning, a `<think>` tag in the answer, `reasoning_tokens` in `usage`, or more completion tokens than the streamed text can hold, or under 2 characters per token (a heuristic): signs of hidden reasoning, which would make prefill look slow and decode look fast. Flagged runs are printed with a warning and kept in the JSON.
 - `--needle N` checks long context; `--parity` saves greedy answers to fixed prompts; `--table FILES...` prints a markdown table of result files, one row per label and engine configuration.
 
-`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`, including the engine configuration the model was started with (`meta`: image and image ID, `VLLM_SPEC`, `CTX`, PolyStrata commit, the Strata engine's version and drafter, `PS_REFUSAL_PROJECTION`, `LLAMA_ABL_MTP`, TensorFold version, extra arguments).
+`--speed` writes results to `$SPARK_LLM_HOME/speed/<model>-<engine>-<timestamp>.json`, including the engine configuration the model was started with (`meta`: image and image ID, `VLLM_SPEC`, `CTX`, PolyStrata commit, the Strata engine's version, drafter and engine settings, `PS_REFUSAL_PROJECTION`, `LLAMA_ABL_MTP`, TensorFold version, extra arguments).
 
 ## Benchmarking with Cybench
 
