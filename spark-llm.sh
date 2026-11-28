@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # spark-llm.sh - install, run, benchmark and clean up open-weight models on an NVIDIA DGX Spark.
 #
-# Models (see `--list`) run on one of four engines, one model at a time, behind an OpenAI-compatible API on :8000
+# Models (see `--list`) run on one of five engines, one model at a time, behind an OpenAI-compatible API on :8000
 # (bearer key required on every inference route; checked at each start). Each engine reads its own format of the same weights:
 #   vllm        vLLM, Spark build (AEON image)               NVFP4 checkpoints
 #   llamacpp    llama.cpp server (CUDA 13, arm64)            GGUF
 #   polystrata  PolyStrata (r0yfire fork), natively           GGUF MoE models: CyberTiel on strata-poly (built here for GB10),
 #                                                            Qwen3.8-Flash-Next on the Strata engine (signed release) + DFlash2
+#   strata      Strata v0.2.13 (Niko1221/Strata), natively   DeepSeek-V4.1-Flash-1017 GGUF on its own engine, strata-dsv41
+#                                                            (signed release), with the DSpark drafter
 #   tensorfold  TensorFold native release (CUDA, sm_121)     MLX 4-bit checkpoints + DFlash2 drafter, natively
 # Interactive menu by default. Flags for scripting:
 #   --list                                    models and the engines each one runs on
-#   --install MODEL [--engine E]              download weights + the engine (image, PolyStrata build or TensorFold release)
+#   --install MODEL [--engine E]              download weights + the engine (image, PolyStrata build, Strata or TensorFold release)
 #   --start   MODEL [--engine E]              (re)start that model; E defaults to the model's first engine
 #   --stop | --status
 #   --speed [cases]                           tokens/s of the running model (prefill + decode), see speedtest.py
@@ -40,7 +42,8 @@ VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.70}"                  # unified memory: stay <
 # MTP with 4 draft tokens: measured on the Spark against 2 and 6 (Qwen3.8-27B NVFP4: +10% decode over 2, 6 no better)
 VLLM_SPEC_DEFAULT='{"method":"mtp","num_speculative_tokens":4}'
 VLLM_SPEC="${VLLM_SPEC-$VLLM_SPEC_DEFAULT}"            # speculative decoding for vLLM models (JSON for --speculative-config); VLLM_SPEC= turns it off
-CTX="${CTX:-262144}"
+CTX_ASKED="${CTX:-}"                                    # set: every model gets it; unset: each model's default below
+CTX="${CTX:-262144}"                                    # (DeepSeek-V4.1-Flash: ST_CTX)
 # PolyStrata: the r0yfire fork (upstream simplexai-labs/PolyStrata + the aarch64 build fix), pinned.
 PS_REPO="${PS_REPO:-https://github.com/r0yfire/PolyStrata.git}"
 PS_REF="${PS_REF:-34e454bbefe03ddd0cd449bce85c1fd2f8ba4029}"
@@ -61,6 +64,18 @@ PS_PROJECTION_FILE="$PS_DIR/terminal/data/experimental-speed-projection/Qwen3.8-
 # decoded about 49% faster for 6-7% slower prompt reading (README, Results). off: no drafter.
 LLAMA_ABL_MTP="${LLAMA_ABL_MTP:-on}"
 FN_ABL_DRAFT="Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf"
+# Strata v0.2.13: the last release of the Strata project that runs DeepSeek-V4.1-Flash, on an engine of its own (strata-dsv41).
+# PolyStrata is built on Strata, and both retired that engine after 0.2.13 (PolyStrata's terminal/strata_control/retired.py
+# refuses a DeepSeek config before anything starts), so DeepSeek runs from a checkout of that release: its server, its pack
+# tool and the signed engine package published with it. Pinned: the release's commit, the package's SHA-256 (Strata's
+# installer also checks the package's signed manifest and every file in it), and every model file (st_files).
+ST_REPO="https://github.com/Niko1221/Strata.git"; ST_TAG=v0.2.13; ST_REF=d2f096475817d4666c364c820b0ca830f751cfc5
+ST_ENGINE_VERSION=0.1.59
+ST_PKG="strata-dsv41-$ST_ENGINE_VERSION-linux-aarch64-cuda-cuda13.tar.gz"
+ST_PKG_SHA256=55f2607d4dc06311aafe335e8b84664c8eecc93376d8a1b59c806f298017749c
+ST_DIR="$BASE/strata-dsv41"; ST_SRC="$ST_DIR/strata-0.2.13"; ST_PID="$BASE/.strata.pid"
+# DeepSeek-V4.1-Flash's default context: its native 1,048,576 tokens (max_position_embeddings), measured here with a ~1M needle
+ST_CTX=1048576
 KEYFILE="$BASE/.api_key"; ACTIVE="$BASE/.active"; ACTIVE_META="$BASE/.active.json"
 YES=0; DRY=0
 
@@ -71,6 +86,8 @@ YES=0; DRY=0
 # Qwen3.8-27B stock: the baseline for the abliterated model, in the same two formats (MLX affine 4-bit with group size 64, and
 # compressed-tensors NVFP4 + FP8 with the same layer split and the MTP head unquantized), pinned to the revisions measured.
 # The NVFP4 one needs a corrected config.json on vLLM (vllm_config_fix).
+# DeepSeek-V4.1-Flash-1017: the 2.00 bpw IQ2_XXS sets, ISTA-DASLab's (stock, the revision Strata v0.2.13 pins) and AtomicChat's
+# abliterated one, whose shards 1-3 are ISTA's byte for byte. The pattern names the shards; st_install fetches them one by one.
 MODELS=(
  "qwen27b-abl|tensorfold|Qwen3.8-27B Uncensored, MLX 4-bit + DFlash2|orcarouter/Qwen3.8-27B-Uncensored-MLX|4-bit/*|qwen27b-abl-mlx|Qwen3.8-27B-Uncensored"
  "qwen27b-abl|vllm|Qwen3.8-27B Uncensored, NVFP4 + MTP|orcarouter/Qwen3.8-27B-Uncensored-NVFP4||qwen-nvfp4|Qwen3.8-27B-Uncensored"
@@ -84,6 +101,8 @@ MODELS=(
  "flashnext|llamacpp|Qwen3.8-Flash-Next IQ3_S (GSQ-RCO)|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000*|flashnext-iq3s|Qwen3.8-Flash-Next"
  "flashnext-abl|polystrata|Qwen3.8-Flash-Next Uncensored IQ3_XXS + DFlash2|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
  "flashnext-abl|llamacpp|Qwen3.8-Flash-Next Uncensored IQ3_XXS|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*,Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
+ "deepseek41|strata|DeepSeek-V4.1-Flash-1017 IQ2_XXS (GSQ-RCO)|ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@cb02422c900df489cea5833e8a92171224059b3c|DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000?-of-00004.gguf|deepseek41/ista-iq2xxs|DeepSeek-V4.1-Flash-1017"
+ "deepseek41-abl|strata|DeepSeek-V4.1-Flash-1017 Uncensored IQ2_XXS|AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF@4f1d2f730cff977961db81789e81bfc0d3e6dd2e|DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000?-of-00004.gguf|deepseek41/atomic-iq2xxs|DeepSeek-V4.1-Flash-1017-Uncensored"
 )
 # DFlash2 drafter for the Qwen3.8-27B family (TensorFold drafts with it; vLLM can too via VLLM_SPEC)
 DRAFTER_27B_REPO="${DRAFTER_27B_REPO:-z-lab/Qwen3.8-27B-DFlash2}"
@@ -177,7 +196,7 @@ preflight(){   # $1 engine (optional), $2 GB the install needs (default 80): bef
   free=$(df -BG --output=avail "$d" | tail -1 | tr -dc 0-9)
   [ "${free:-0}" -ge "$want" ] || die "need ~$want GB free in $BASE (have ${free:-?} GB)"
 }
-disk_gb(){ case "$1" in flashnext*) echo 90;; *) echo 80;; esac; }   # $1 model: GB an install needs (Flash-Next: 85 GB of GGUF + pack, engine)
+disk_gb(){ case "$1" in deepseek41*) st_need_gb "$1";; flashnext*) echo 90;; *) echo 80;; esac; }   # $1 model: GB an install needs (Flash-Next: 85 GB of GGUF + pack, engine)
 
 download(){   # $1 model, $2 engine
   local spec repo rev="" inc p; spec=$(field "$1" "$2" 4); inc=$(field "$1" "$2" 5)
@@ -196,7 +215,7 @@ needs_drafter(){ [[ "$1" == qwen27b* ]] && { [ "$2" = tensorfold ] || [[ "$2" = 
 
 install_model(){   # $1 model, $2 engine (optional)
   local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight "$e" "$(disk_gb "$m")"; hf_cli
-  download "$m" "$e"
+  [ "$e" = strata ] || download "$m" "$e"   # (Strata's files: st_install, one pinned file at a time)
   if needs_drafter "$m" "$e"; then
     say "Downloading the DFlash2 drafter ($DRAFTER_27B_REPO)"
     run "$BASE/venv/bin/hf" download "$DRAFTER_27B_REPO" --local-dir "$(drafter_27b)"
@@ -205,6 +224,7 @@ install_model(){   # $1 model, $2 engine (optional)
     vllm) run docker pull "$VLLM_IMAGE" ;;
     llamacpp) run docker pull "$LLAMA_IMAGE" ;;
     polystrata) ps_install "$m" ;;
+    strata) st_install "$m" ;;
     tensorfold) tf_install ;;
     *) die "engine '$e' is not wired into install_model" ;;
   esac
@@ -449,12 +469,246 @@ ps_start(){   # $1 model, $2 run config from ps_config
       .venv/bin/python serve/server.py --engine strata --config "$cfg" --host "$BIND" --port "$PORT" )
 }
 
-# ---------------------------------------------------------------- native engines (PolyStrata, TensorFold)
+# ---------------------------------------------------------------- Strata v0.2.13: DeepSeek-V4.1-Flash (native, not Docker)
+# Strata's own steps for an ISTA-DAS set (setup.py install_dsv41, dsv41_pack_cmd): the set's four shards, three files every set
+# shares, the signed engine package, and a pack of a few MB (the tensor map, the tokenizer and a 0.5 MB Engram file) that points
+# at the GGUF files, which the engine reads where they are. Nothing large is copied.
+ST_ISTA_SPEC="ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@cb02422c900df489cea5833e8a92171224059b3c"
+ST_UNSLOTH_SPEC="unsloth/DeepSeek-V4.1-Flash-1017-GGUF@8a6ec9cf118e785a362ea94ee123c61c70553be6"
+ST_ENGRAM=DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf
+ST_META=UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf
+ST_DSPARK=dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf
+st_shared(){ echo "$BASE/models/deepseek41/shared"; }
+st_py(){ echo "$ST_SRC/.venv/bin/python"; }
+st_exe(){ echo "$ST_DIR/engine-dsv41/$ST_ENGINE_VERSION-linux-aarch64-cuda-cuda13/strata-dsv41"; }   # where Strata's installer puts it
+
+# Every file, as "SHA-256 size name" (the name relative to the set's folder, or to st_shared for "shared"): Strata v0.2.13's pins
+# (setup.py DSV41_ISTA_FILES and DSV41_FILES) for ISTA-DASLab's set and the shared files, and for AtomicChat's shard 4 the Hub's
+# SHA-256 at the revision in its MODELS row (its shards 1-3 are ISTA's, the same SHA-256 at both revisions).
+#   the Engram    ISTA's Engram table (110.6 GB), read by both sets (pack_gguf --engram)
+#   the metadata  shard 1 of Unsloth's UD-Q8_K_XL set (5.8 MB): pack_gguf --engram-meta reads only its header
+#   DSpark        the speculative drafter (Q8_0, 8 GB, pack_gguf --dspark-gguf); the engine drafts with it on its own
+st_files(){   # $1 deepseek41 | deepseek41-abl | shared
+  local s=DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS
+  case "$1" in
+    shared) printf '%s %s %s\n' \
+      eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a 110595290816 "$ST_ENGRAM" \
+      cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f 5780589 "$ST_META" \
+      6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a 7976914240 "$ST_DSPARK" ;;
+    deepseek41|deepseek41-abl)
+      printf '%s %s %s\n' \
+        d46efb67ccffd8fb5d7f18b423896381b9e06d8491e161c370ddf3b05b07e050 39075714624 "$s-00001-of-00004.gguf" \
+        cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70 39388449504 "$s-00002-of-00004.gguf" \
+        9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3 39246891616 "$s-00003-of-00004.gguf"
+      if [ "$1" = deepseek41 ]; then
+        printf '%s %s %s\n' 9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059 20527837312 "$s-00004-of-00004.gguf"
+      else
+        printf '%s %s %s\n' 92e1b7aac2c27451977f093b89207a877221bba909424309450420f66fa42bf9 20527837312 "$s-00004-of-00004.gguf"
+      fi ;;
+    *) die "internal: no Strata files for '$1'" ;;
+  esac
+}
+st_source(){   # $1 model, $2 file name -> the repo@revision it is downloaded from
+  case "$2" in "$ST_ENGRAM") echo "$ST_ISTA_SPEC";; "$ST_META"|"$ST_DSPARK") echo "$ST_UNSLOTH_SPEC";; *) field "$1" strata 4;; esac; }
+
+# A file is hashed against its pin once. The result is kept beside the file, in .spark-llm-verified ("SHA-256 size mtime name"),
+# and holds while the file keeps that size and modification time, so later installs and every start check ~257 GB without
+# hashing them again. A link (a shard both sets share) is checked as the file it points to.
+st_real(){ readlink -f -- "$1" 2>/dev/null; }          # $1 path -> the file itself
+st_stat(){ stat -L -c '%s %Y' -- "$1" 2>/dev/null; }    # $1 file -> "size mtime"
+st_ok(){   # $1 dir, $2 SHA-256, $3 size, $4 name: in place, the pinned size, and hashed as it is now
+  local f st; f=$(st_real "$1/$4") || return 1; [ -f "$f" ] || return 1; st=$(st_stat "$f") || return 1
+  [ "${st%% *}" = "$3" ] && grep -qxF "$2 $st $(basename "$f")" "$(dirname "$f")/.spark-llm-verified" 2>/dev/null
+}
+st_verify(){   # $1 dir, $2 SHA-256, $3 size, $4 name: hash the file unless st_ok, and record it. A file that does not match is an error.
+  local f st got stamp
+  st_ok "$@" && return 0
+  if [ "$DRY" = 1 ]; then printf '+ %s\n' "check sha256 of $1/$4 is $2"; return 0; fi
+  f=$(st_real "$1/$4") && [ -f "$f" ] || die "missing $1/$4"
+  st=$(st_stat "$f")
+  [ "${st%% *}" = "$3" ] || die "$1/$4 is ${st%% *} bytes, the pinned file $3: delete it and run --install again"
+  say "Checking $4 against its pinned SHA-256"
+  got=$(sha256sum < "$f"); got=${got%% *}
+  [ "$got" = "$2" ] || die "$1/$4 does not match its pinned SHA-256 ($2, it hashes to $got): delete it and run --install again"
+  stamp="$(dirname "$f")/.spark-llm-verified"
+  { awk -v n="$(basename "$f")" '$4 != n' "$stamp" 2>/dev/null || true; echo "$2 $st $(basename "$f")"; } > "$stamp.new"
+  mv "$stamp.new" "$stamp"
+}
+
+# ISTA's Engram (110.6 GB) is stored on Xet only, and huggingface_hub refuses a plain-HTTP download above 50 GB, its fallback when
+# Xet is off or fails. The Hub's resolve URL also serves the file over HTTP with Range requests, so curl fetches it into a .part
+# file and resumes after any break; each transfer resolves the URL again (a fresh signed link).
+st_curl(){   # $1 dir, $2 size, $3 name, $4 repo@revision
+  local f="$1/$3" u="https://huggingface.co/${4%%@*}/resolve/${4#*@}/$3" n=0
+  say "Downloading $3 ($(($2 / 1000000000)) GB) from ${4%%@*} at ${4#*@}, over HTTP (resumable)"
+  if [ "$DRY" = 1 ]; then printf '+ %s\n' "curl -fL -C - -o $f.part $u   (until it has $2 bytes; then mv $f.part $f)"; return 0; fi
+  while [ "$(stat -c %s "$f.part" 2>/dev/null || echo 0)" -lt "$2" ]; do
+    n=$((n + 1)); [ "$n" -le 40 ] || die "the download of $3 broke off 40 times: run --install again to resume it"
+    curl -fL --progress-bar --connect-timeout 30 --speed-limit 100000 --speed-time 120 -C - -o "$f.part" "$u" || sleep 20
+  done
+  [ "$(stat -c %s "$f.part")" = "$2" ] || die "$f.part is larger than the pinned file ($2 bytes): delete it and run --install again"
+  mv "$f.part" "$f"
+}
+st_fetch(){   # $1 model, $2 dir, $3 SHA-256, $4 size, $5 name: put the file in place unless it is there (st_verify checks it)
+  local m=$1 d=$2 sha=$3 size=$4 n=$5 o spec
+  if [ -L "$d/$n" ] && [ ! -e "$d/$n" ]; then run rm -f "$d/$n"; fi   # a link whose file is gone
+  [ -e "$d/$n" ] && return 0
+  [ "$DRY" = 1 ] || mkdir -p "$(dirname "$d/$n")"
+  # a shard both sets share (1-3) that the other set's folder holds, hashed: a link to it, not a second download
+  for o in "$BASE"/models/deepseek41/*/; do
+    o=${o%/}; [ "$o" != "$d" ] && [ ! -L "$o/$n" ] || continue
+    if st_ok "$o" "$sha" "$size" "$n"; then
+      say "Linking $n from $(basename "$o") (the same file)"; run ln -s "../$(basename "$o")/$n" "$d/$n"; return 0; fi
+  done
+  spec=$(st_source "$m" "$n")
+  if [ "$n" = "$ST_ENGRAM" ]; then st_curl "$d" "$size" "$n" "$spec"; return; fi
+  say "Downloading $n from ${spec%%@*} at ${spec#*@}"
+  run "$BASE/venv/bin/hf" download "${spec%%@*}" "$n" --revision "${spec#*@}" --local-dir "$d"
+}
+st_need_gb(){   # $1 model -> GB its install still downloads (files in neither set's folder), plus 5 for Strata and its engine
+  local sz n f bytes=0
+  while read -r _ sz n; do
+    for f in "$(mdir "$1" strata)/$n" "$BASE"/models/deepseek41/*/"$n"; do [ "$(stat -L -c %s -- "$f" 2>/dev/null)" = "$sz" ] && continue 2; done
+    bytes=$((bytes + sz))
+  done < <(st_files "$1")
+  while read -r _ sz n; do [ "$(stat -L -c %s -- "$(st_shared)/$n" 2>/dev/null)" = "$sz" ] || bytes=$((bytes + sz)); done < <(st_files shared)
+  echo $((bytes / 1000000000 + 5))
+}
+
+st_install(){   # $1 model: Strata v0.2.13, its DeepSeek engine, the model's files (hashed against their pins) and its pack.
+  local m=$1 d s sha sz n sh=()   # Each step is skipped when done.
+  need git; need curl; need sha256sum; need python3
+  if [ ! -d "$ST_SRC/.git" ]; then say "Cloning Strata $ST_TAG ($ST_REPO)"; run git clone -q --depth 1 --branch "$ST_TAG" "$ST_REPO" "$ST_SRC"; fi
+  if [ -d "$ST_SRC/.git" ] && [ "$(git -C "$ST_SRC" rev-parse HEAD)" != "$ST_REF" ]; then
+    die "$ST_SRC is not Strata $ST_TAG ($ST_REF): move it aside and install again"; fi
+  if [ ! -x "$(st_py)" ]; then say "Creating Strata's Python environment"; run python3 -m venv "$ST_SRC/.venv"; fi
+  run "$(st_py)" -m pip install -q --disable-pip-version-check -r "$ST_SRC/requirements.txt"
+  st_engine_install
+  d=$(mdir "$m" strata); s=$(st_shared)
+  # fd 3, so nothing these steps run can read the list
+  while read -r sha sz n <&3; do st_fetch "$m" "$s" "$sha" "$sz" "$n"; done 3< <(st_files shared)
+  while read -r sha sz n <&3; do st_fetch "$m" "$d" "$sha" "$sz" "$n"; done 3< <(st_files "$m")
+  while read -r sha sz n <&3; do st_verify "$s" "$sha" "$sz" "$n"; done 3< <(st_files shared)
+  while read -r sha sz n <&3; do st_verify "$d" "$sha" "$sz" "$n"; sh+=("$n"); done 3< <(st_files "$m")
+  st_pack "$m" "${sh[@]}"
+}
+
+st_engine_install(){   # the signed package of the release: its SHA-256 pinned here, then Strata's own installer (signature, every file)
+  if [ -x "$(st_exe)" ]; then say "Strata's DeepSeek engine $ST_ENGINE_VERSION already installed"; return; fi
+  local u="https://github.com/Niko1221/Strata/releases/download/$ST_TAG/$ST_PKG"
+  say "Installing Strata's DeepSeek engine $ST_ENGINE_VERSION (the release's signed package for linux-aarch64, CUDA 13)"
+  if [ "$DRY" = 1 ]; then
+    run curl -fsSL -o "$ST_DIR/$ST_PKG" "$u"
+    printf '+ %s\n' "check sha256 of $ST_DIR/$ST_PKG is $ST_PKG_SHA256" "strata_control.dsv41_engine.install_package -> $(st_exe)"
+    return
+  fi
+  mkdir -p "$ST_DIR"
+  if [ ! -s "$ST_DIR/$ST_PKG" ]; then curl -fsSL -o "$ST_DIR/$ST_PKG" "$u" || die "the engine package download failed ($u)"; fi
+  ( cd "$ST_DIR" && printf '%s  %s\n' "$ST_PKG_SHA256" "$ST_PKG" | sha256sum -c --quiet - ) ||
+    { rm -f "$ST_DIR/$ST_PKG"; die "$ST_PKG does not match the pinned SHA-256 ($ST_PKG_SHA256); deleted it"; }
+  ( cd "$ST_SRC" && "$(st_py)" -B - "$ST_DIR/engine-dsv41" "$ST_DIR/$ST_PKG" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, ".")
+from strata_control import dsv41_engine
+sys.exit(0 if dsv41_engine.install_package(Path(sys.argv[1]), sys.argv[2]) else 1)
+PY
+  ) || die "Strata's installer refused the engine package (see above)"
+  [ -x "$(st_exe)" ] || die "the engine package installed no $(st_exe)"
+}
+
+st_pack_dir(){ echo "$(mdir "$1" strata)/pack"; }   # $1 model
+st_pack_want(){ echo "strata $ST_REF"; st_files "$1"; st_files shared; }   # $1 model: what the pack's stamp must say
+st_pack_ok(){ [ "$(cat "$(st_pack_dir "$1")/.spark-llm-pack" 2>/dev/null)" = "$(st_pack_want "$1")" ]; }
+st_pack(){   # $1 model, $2.. its shard names: setup.py's dsv41_pack_cmd and the shipped expert profile, then the engine's --pack-info
+  local m=$1 pack s info; shift; pack=$(st_pack_dir "$m"); s=$(st_shared)
+  if st_pack_ok "$m"; then say "Strata pack of $m is up to date ($pack)"; return; fi
+  say "Packing $m for Strata's DeepSeek engine (tools/dsv41/pack_gguf.py, a few seconds)"
+  run rm -rf "$pack"
+  # the drafter's noise token and markov rank are setup's: ISTA-DAS's files do not carry them (without them it drafts deep less often)
+  run env -C "$ST_SRC" "$(st_py)" tools/dsv41/pack_gguf.py --model "$(mdir "$m" strata)" --shards "$@" \
+    --engram "$s/$ST_ENGRAM" --engram-meta "$s/$ST_META" --dspark-gguf "$s/$ST_DSPARK" \
+    --dspark-noise-token 128799 --dspark-markov-rank 256 --out "$pack"
+  # the experts the 2.00 bpw sets route to most (shipped with the release): the engine's expert store starts with them
+  run cp "$ST_SRC/data/dsv41/profile-2.00.bin" "$pack/expert-profile.bin"
+  [ "$DRY" = 1 ] && return
+  info="$BASE/logs/strata-pack-info-$m.log"
+  if ! env LD_LIBRARY_PATH="$(dirname "$(st_exe)")" "$(st_exe)" --pack-info --pack "$pack" >"$info" 2>&1 ||
+     ! grep -q "all present" "$info" || grep -q MISSING "$info"; then
+    die "the engine finds the pack of $m incomplete: see $info"; fi
+  st_pack_want "$m" > "$pack/.spark-llm-pack"
+}
+
+# The run config of a DeepSeek set (JSON for serve/server.py), written at each start: the arguments setup.py writes for an
+# ISTA-DAS set (strata_control/setup_config.py dsv41_config_for), with this machine's values:
+#   --max-context              CTX: ST_CTX (1,048,576) unless CTX is set
+#   --eos 1, --vision off      the end-of-text token; no picture reader (not downloaded)
+#   --dspark auto, --dspark-conf 0.65      the drafter, with setup's confidence floor for the ISTA-DAS sets
+#   --prefill-chunk 16384, DS4_ASYNC_T=4   setup's settings for a GPU on unified memory of 64 GB or more (dsv41_prefill_chunk_args,
+#                              dsv41_config_env): the GB10 is one
+#   --experts 6                the model's own 6 routed experts per token (num_experts_per_tok), stated: the engine's `auto` can pick 5
+# The engine package is checked against its signed manifest at each start (every file hashed; a dry run checks sizes).
+st_json(){   # $1 write|preview, $2 model, $3 config path
+  ( cd "$ST_SRC" && "$(st_py)" -B - "$1" "$3" "$(st_exe)" "$(st_pack_dir "$2")" "$CTX" "$(served "$2" strata)" \
+      "$BASE/logs/strata-$2.log" "$PORT" "$ST_SRC" <<'PY'
+import json, sys
+from pathlib import Path
+mode, cfg, exe, pack, ctx, name, log, port, src = sys.argv[1:]
+sys.path.insert(0, src)
+from strata_control import dsv41_engine, engine_component as ec
+try:
+    ec.verify(ec.read_manifest(Path(exe).parent), full=(mode == "write"))
+except Exception as exc:
+    sys.exit(f"the DeepSeek engine in {Path(exe).parent} does not match its package: {exc} (run --install again)")
+conf = {"exe": exe,
+        "args": ["--pack", pack, "--max-context", ctx, "--eos", "1", "--vision", "off", "--dspark", "auto", "--dspark-conf", "0.65",
+                 "--prefill-chunk", "16384", "--experts", "6"],
+        "env": {"DS4_ASYNC_T": "4"}, "cwd": src, "tokenizer": f"{pack}/tokenizer", "model_name": name, "arch": "deepseek41",
+        "lib_dirs": dsv41_engine.lib_dirs(exe), "log": log, "port": int(port), "engine_ready_s": 3600}
+text = json.dumps(conf, indent=1)
+if mode == "write":
+    Path(cfg).write_text(text + "\n", encoding="utf-8")
+else:
+    print(text)
+PY
+  )
+}
+st_config(){   # $1 model -> prints ONLY the path of its run config; messages go to stderr
+  local cfg="$ST_DIR/spark-llm-$1.json"
+  st_json write "$1" "$cfg" >&2 || die "could not write the Strata run config of $1"
+  echo "$cfg"
+}
+st_cfg_get(){   # $1 run config, $2 args|env -> that entry, on one line (empty when unknown)
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import json, sys
+v = json.load(open(sys.argv[1])).get(sys.argv[2])
+print(" ".join(v) if isinstance(v, list) else " ".join(f"{k}={x}" for k, x in (v or {}).items()))
+PY
+}
+
+st_start(){   # $1 model, $2 run config from st_config
+  local m=$1 cfg=${2:-} key
+  if [ "$DRY" = 1 ]; then
+    say "(dry run: would start $m on Strata $ST_TAG's DeepSeek engine on $BIND:$PORT, ${CTX} ctx)"
+    if [ -x "$(st_py)" ] && [ -x "$(st_exe)" ]; then
+      say "(dry run: the run config it would write to $ST_DIR/spark-llm-$m.json:)"; st_json preview "$m" -
+    else say "(dry run: no run config to show: Strata or its DeepSeek engine is not installed under $ST_DIR)"; fi
+    return
+  fi
+  say "Starting $(field "$m" strata 3) on Strata $ST_TAG's DeepSeek engine $ST_ENGINE_VERSION (DSpark drafter, ${CTX} ctx)"
+  key=$(api_key)
+  # The key goes in through the environment: serve/server.py's --api-key defaults to $STRATA_API_KEY. Not argv.
+  ( cd "$ST_SRC" || die "missing $ST_SRC (run --install $m)"
+    STRATA_API_KEY=$key native_launch "$ST_PID" "$BASE/logs/strata-server.log" \
+      .venv/bin/python serve/server.py --engine strata --config "$cfg" --host "$BIND" --port "$PORT" )
+}
+
+# ---------------------------------------------------------------- native engines (PolyStrata, Strata, TensorFold)
 # A native server runs in its own session, so --stop can end it and every process it spawned together.
 # The PID file holds "PID START": the session leader's PID (`exec` makes it the server itself, not a wrapper shell)
 # and its start time from /proc. Both must match, and the command line must contain the marker below, before
 # anything is signaled: a PID file that outlived its server (a reboot, a crash) must not get an unrelated process killed.
-PS_MARK="$PS_DATA/strata-"; TF_MARK="$TF_DIR/"   # in the server's argv: its config path / its executable path
+PS_MARK="$PS_DATA/strata-"; ST_MARK="$ST_DIR/spark-llm-"; TF_MARK="$TF_DIR/"   # in the server's argv: its config path / its executable path
 
 # Native servers get only this environment, so credentials exported in the calling shell (HF_TOKEN, cloud keys,
 # OPENAI_API_KEY...) do not reach third-party code. Unset in a subshell: no value ever goes through an argv.
@@ -659,13 +913,13 @@ set_model_args(){   # $1 engine, $2 model -> MODEL_ARGS: the flags that depend o
       # OrcaRouter's separate MTP draft model, with the draft depth its model card recommends
       if [ "$LLAMA_ABL_MTP" = on ]; then
         MODEL_ARGS+=(-md "/models/$FN_ABL_DRAFT" -ngld 99 --spec-type draft-mtp --spec-draft-n-max 3); fi ;;
-    polystrata:*|tensorfold:*) MODEL_ARGS=() ;;
+    polystrata:*|strata:*|tensorfold:*) MODEL_ARGS=() ;;
     *) die "no $1 settings for model '$2': add them to set_model_args" ;;
   esac
 }
 
 missing_for(){   # $1 model, $2 engine -> prints what a start needs but is not there, one item per line (nothing = runnable)
-  local m=$1 e=$2 d g; d=$(mdir "$m" "$e")
+  local m=$1 e=$2 d g sha sz n; d=$(mdir "$m" "$e")
   case "$e" in
     vllm)
       [ -s "$d/config.json" ] || echo "weights ($d)"
@@ -687,6 +941,12 @@ missing_for(){   # $1 model, $2 engine -> prints what a start needs but is not t
         [ -x "$PS_DIR/build-poly-spark/strata-poly" ] || echo "the strata-poly build"
       fi
       [ -x "$PS_DIR/terminal/.venv/bin/python" ] || echo "PolyStrata's Python environment" ;;
+    strata)   # every file in place and hashed against its pin by an install (st_ok: no hashing here)
+      while read -r sha sz n; do st_ok "$d" "$sha" "$sz" "$n" || echo "$n (downloaded and checked)"; done < <(st_files "$m")
+      while read -r sha sz n; do st_ok "$(st_shared)" "$sha" "$sz" "$n" || echo "$n (downloaded and checked)"; done < <(st_files shared)
+      [ -x "$(st_py)" ] || echo "Strata $ST_TAG and its Python environment ($ST_SRC)"
+      [ -x "$(st_exe)" ] || echo "Strata's DeepSeek engine $ST_ENGINE_VERSION"
+      st_pack_ok "$m" || echo "the Strata pack of $m ($(st_pack_dir "$m"))" ;;
     tensorfold)
       [ -s "$(tf_model_path "$m")/config.json" ] || echo "weights ($(tf_model_path "$m"))"
       [ -x "$(tf_bin)" ] || echo "TensorFold $TF_VERSION"
@@ -759,6 +1019,7 @@ wait_ready(){   # $1 engine, $2 model, $3 container (docker engines)
   while [ "$SECONDS" -lt "$deadline" ]; do
     case "$e" in
       polystrata) native_alive "$PS_PID" "$PS_MARK" || { tail -40 "$BASE/logs/polystrata-server.log"; die "PolyStrata exited"; } ;;
+      strata) native_alive "$ST_PID" "$ST_MARK" || { tail -40 "$BASE/logs/strata-server.log"; die "Strata exited"; } ;;
       tensorfold) native_alive "$TF_PID" "$TF_MARK" || { tail -40 "$BASE/logs/tensorfold-$m.log"; die "TensorFold exited"; } ;;
       vllm|llamacpp) [ "$(docker inspect --type container -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || { docker logs --tail 60 "$c" 2>&1 || true; die "container $c exited"; } ;;
       *) die "engine '$e' is not wired into wait_ready" ;;
@@ -791,6 +1052,7 @@ stop_all(){
     for c in $(our_containers); do say "Stopping $c"; run -q docker rm -f "$c"; done
   fi
   native_stop "$PS_PID" PolyStrata "$PS_MARK"
+  native_stop "$ST_PID" Strata "$ST_MARK"
   native_stop "$TF_PID" TensorFold "$TF_MARK"
   [ "$DRY" = 1 ] || rm -f "$ACTIVE" "$ACTIVE_META"
   # the port must be free before the next start: a server still holding it would answer in the new one's place
@@ -837,12 +1099,16 @@ llama_start(){   # $1 model, $2 container name
 start_model(){   # $1 model, $2 engine (optional)
   local m e cfg=""; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}")
   check_bind
+  if [ "$e" = strata ]; then   # DeepSeek-V4.1-Flash: its native context unless CTX is set, and never more
+    [ -n "$CTX_ASKED" ] || CTX=$ST_CTX
+    [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le "$ST_CTX" ] || die "CTX=$CTX: DeepSeek-V4.1-Flash reads at most $ST_CTX tokens"
+  fi
   if is_docker_engine "$e"; then need_docker; fi
   check_runnable "$m" "$e"   # before stop_all: a start that cannot work must not take down the model that is serving
   make_dirs
   if [ "$DRY" = 0 ]; then
     ensure_key
-    case "$e" in polystrata) cfg=$(ps_config "$m") ;; vllm) vllm_auth_module ;; esac
+    case "$e" in polystrata) cfg=$(ps_config "$m") ;; strata) cfg=$(st_config "$m") ;; vllm) vllm_auth_module ;; esac
   fi
   stop_all
   local name="llm-$m"
@@ -850,6 +1116,7 @@ start_model(){   # $1 model, $2 engine (optional)
     vllm) vllm_start "$m" "$name" ;;
     llamacpp) llama_start "$m" "$name" ;;
     polystrata) ps_start "$m" "$cfg" ;;
+    strata) st_start "$m" "$cfg" ;;
     tensorfold) tf_start "$m" ;;
     *) die "engine '$e' is not wired into start_model" ;;
   esac
@@ -875,6 +1142,10 @@ write_active(){   # $1 model, $2 engine, $3 container: .active ("model engine bi
                 if [ "$(ps_kind "$m")" = strata ]; then
                   kv+=("ps_engine=strata" "ps_engine_version=$(ps_engine_version "$PS_DATA/strata-$m.json")" "drafter=$(basename "$PS_DRAFTER")"
                        "pack_args=$(ps_pack_args "$m")" "engine_env=$(ps_engine_env "$m")" "refusal_projection=$(ps_projection "$m")"); fi ;;
+    strata) kv+=("strata_repo=$ST_REPO" "strata_ref=$ST_REF" "strata_head=$(git -C "$ST_SRC" rev-parse HEAD 2>/dev/null || true)"
+                 "engine_version=$ST_ENGINE_VERSION" "engine_sha256=$ST_PKG_SHA256"
+                 "gguf=$(st_files "$m" | awk 'NR == 1 {print $3}')" "shard4_sha256=$(st_files "$m" | awk 'END {print $1}')"
+                 "engine_args=$(st_cfg_get "$ST_DIR/spark-llm-$m.json" args)" "engine_env=$(st_cfg_get "$ST_DIR/spark-llm-$m.json" env)") ;;
     tensorfold) kv+=("tf_version=$TF_VERSION" "tf_sha256=$TF_SHA256" "extra=${TF_EXTRA:-}")
                 if needs_drafter "$m" tensorfold; then kv+=("drafter=$DRAFTER_27B_REPO"); fi ;;
   esac
@@ -907,11 +1178,11 @@ status(){
     local c n=0; for c in $(our_containers); do docker ps -a --filter "name=^/?$c\$" --format '  {{.Names}}  {{.Status}}  {{.Image}}'; n=$((n+1)); done
     [ "$n" -gt 0 ] || echo "  none"
   else echo "  (docker is not installed)"; fi
-  native_status "$PS_PID" PolyStrata "$PS_MARK"; native_status "$TF_PID" TensorFold "$TF_MARK"
+  native_status "$PS_PID" PolyStrata "$PS_MARK"; native_status "$ST_PID" Strata "$ST_MARK"; native_status "$TF_PID" TensorFold "$TF_MARK"
   say "Active: $(cat "$ACTIVE" 2>/dev/null || echo none)"
   say "Memory"; free -g | sed -n 1,2p
   say "Disk"
-  local p paths=(); for p in "$BASE/models"/* "$PS_DIR" "$PS_DATA" "$TF_DIR"; do [ -e "$p" ] && paths+=("$p"); done
+  local p paths=(); for p in "$BASE/models"/* "$PS_DIR" "$PS_DATA" "$ST_DIR" "$TF_DIR"; do [ -e "$p" ] && paths+=("$p"); done
   if [ ${#paths[@]} -gt 0 ]; then du -sh "${paths[@]}" 2>/dev/null || true; fi
   [ -n "$(compgen -G "$BASE/models/*")" ] || echo "  no models installed"
   echo "API key file: $KEYFILE"
@@ -1093,7 +1364,7 @@ cleanup(){
     echo "  1) stop      stop model servers"
     echo "  2) containers  stop + remove Docker images and Cybench containers"
     echo "  3) weights   containers + delete downloaded model weights"
-    echo "  4) all       everything under $BASE (weights, PolyStrata, Cybench, results, venv, API key)"
+    echo "  4) all       everything under $BASE (weights, PolyStrata, Strata, Cybench, results, venv, API key)"
     read -r -p "Level [1-4]: " n; case "$n" in 1) level=stop;; 2) level=containers;; 3) level=weights;; 4) level=all;; *) return;; esac
   fi
   case "$level" in stop|containers|weights|all) ;; *) die "unknown cleanup level '$level' (stop, containers, weights or all)" ;; esac
