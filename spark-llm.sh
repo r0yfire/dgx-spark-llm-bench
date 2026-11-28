@@ -68,9 +68,14 @@ YES=0; DRY=0
 #   key|engine|title|HF repo[@revision]|--include pattern ("," separates several)|folder under models/|served name
 # A model's first row is its default engine: the fastest one measured on the Spark (README, "Results").
 # Flash-Next stock: the GSQ-RCO files at the revision PolyStrata's setup.py pins (HF_REVISIONS), so they are the bytes it checks.
+# Qwen3.8-27B stock: the baseline for the abliterated model, in the same two formats (MLX affine 4-bit with group size 64, and
+# compressed-tensors NVFP4 + FP8 with the same layer split and the MTP head unquantized), pinned to the revisions measured.
+# The NVFP4 one needs a corrected config.json on vLLM (vllm_config_fix).
 MODELS=(
  "qwen27b-abl|tensorfold|Qwen3.8-27B Uncensored, MLX 4-bit + DFlash2|orcarouter/Qwen3.8-27B-Uncensored-MLX|4-bit/*|qwen27b-abl-mlx|Qwen3.8-27B-Uncensored"
  "qwen27b-abl|vllm|Qwen3.8-27B Uncensored, NVFP4 + MTP|orcarouter/Qwen3.8-27B-Uncensored-NVFP4||qwen-nvfp4|Qwen3.8-27B-Uncensored"
+ "qwen27b|tensorfold|Qwen3.8-27B (stock), MLX 4-bit + DFlash2|mlx-community/Qwen3.8-27B-4bit@b935172e4bb5dcd0543774a34748fb92422e3027||qwen27b-stock-mlx|Qwen3.8-27B"
+ "qwen27b|vllm|Qwen3.8-27B (stock), NVFP4 + MTP|RedHatAI/Qwen3.8-27B-NVFP4@5dd2bd1fffbfced02b863d69542514509c312b10||qwen27b-stock-nvfp4|Qwen3.8-27B"
  "cybertiel|polystrata|CyberTiel 35B-A3B UD-Q4_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q4_K_XL.gguf|cybertiel-q4|CyberTiel"
  "cybertiel|llamacpp|CyberTiel 35B-A3B UD-Q4_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q4_K_XL.gguf|cybertiel-q4|CyberTiel"
  "cybertiel-q8|polystrata|CyberTiel 35B-A3B UD-Q8_K_XL|peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP|*UD-Q8_K_XL.gguf|cybertiel-q8|CyberTiel"
@@ -610,6 +615,36 @@ PY
 image_pythonpath(){   # $1 image -> the PYTHONPATH it sets (kept behind ours)
   { docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null || true; } | sed -n 's/^PYTHONPATH=//p' | head -1
 }
+# The compressed-tensors in the vLLM image (0.15) refuses activation ordering on any group that is not quantized by group or
+# tensor_group ("Must use group or tensor_group quantization strategy in order to apply activation ordering"). RedHatAI's
+# stock Qwen3.8-27B NVFP4 records actorder "static" on its FP8 per-channel group: an option of GPTQ calibration that, in
+# compressed-tensors' own words, "doesn't change the quantization format" ("static" is an alias of "weight"; vLLM's FP8 and
+# NVFP4 schemes never read it). vllm_start mounts this corrected copy of config.json over the original, with those flags
+# cleared and nothing else changed; the downloaded files stay as the Hub has them. Models that need no correction get none.
+vllm_config_fix(){   # $1 model -> prints the corrected config.json's path (written unless dry run), or nothing if none needed
+  python3 - "$(mdir "$1" vllm)/config.json" "$BASE/vllm-config/$1-config.json" "$DRY" <<'PY'
+import json, os, sys
+src, dst, dry = sys.argv[1:]
+if not os.path.exists(src):   # not downloaded yet (a dry run can get here)
+    sys.exit(0)
+conf = json.load(open(src))
+quant = conf.get("quantization_config") or conf.get("text_config", {}).get("quantization_config") or {}
+cleared = 0
+for group in (quant.get("config_groups") or {}).values():
+    for args in (group.get("weights"), group.get("input_activations")):
+        if args and args.get("actorder") in ("static", "weight") and args.get("strategy") not in ("group", "tensor_group"):
+            args["actorder"] = None
+            cleared += 1
+if cleared:
+    if dry != "1":
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "w") as f:
+            json.dump(conf, f, indent=2)
+    print(dst)
+elif dry != "1" and os.path.exists(dst):
+    os.remove(dst)
+PY
+}
 
 # ---------------------------------------------------------------- start / stop
 set_model_args(){   # $1 engine, $2 model -> MODEL_ARGS: the flags that depend on the model, not only on the engine
@@ -764,9 +799,11 @@ stop_all(){
 }
 
 vllm_start(){   # $1 model, $2 container name
-  local m=$1 name=$2 spec=$VLLM_SPEC drafter=() specargs=() pp
+  local m=$1 name=$2 spec=$VLLM_SPEC drafter=() specargs=() fixmount=() pp
   if [ -n "$spec" ]; then specargs=(--speculative-config "$spec"); fi
   if [[ "$spec" == *dflash* ]]; then drafter=(-v "$(drafter_27b):/drafter:ro"); fi
+  VLLM_CONFIG_FIX=$(vllm_config_fix "$m")   # write_active records it
+  if [ -n "$VLLM_CONFIG_FIX" ]; then fixmount=(-v "$VLLM_CONFIG_FIX:/model/config.json:ro"); fi
   pp=$(image_pythonpath "$VLLM_IMAGE")
   say "Starting $(field "$m" vllm 3) on vLLM (speculative: ${spec:-off}, ${CTX} ctx, gpu-util $VLLM_GPU_UTIL)"
   # The key reaches vLLM as VLLM_API_KEY: `-e VLLM_API_KEY` (no value) copies it from this subshell's environment.
@@ -776,7 +813,7 @@ vllm_start(){   # $1 model, $2 container name
       -e TORCH_CUDA_ARCH_LIST=12.1a -e CUTE_DSL_ARCH=sm_121a \
       -e VLLM_USE_FLASHINFER_SAMPLER=1 -e VLLM_ENABLE_CUDA_COMPATIBILITY=0 \
       -e VLLM_API_KEY -e "PYTHONPATH=/opt/spark-llm-auth${pp:+:$pp}" -v "$BASE/vllm-auth:/opt/spark-llm-auth:ro" \
-      -v "$(mdir "$m" vllm):/model:ro" "${drafter[@]}" --entrypoint vllm "$VLLM_IMAGE" \
+      -v "$(mdir "$m" vllm):/model:ro" "${fixmount[@]}" "${drafter[@]}" --entrypoint vllm "$VLLM_IMAGE" \
       serve /model --served-model-name "$(served "$m" vllm)" "${specargs[@]}" \
       --gpu-memory-utilization "$VLLM_GPU_UTIL" --max-model-len "$CTX" --max-num-seqs 4 \
       --trust-remote-code "${MODEL_ARGS[@]}" --middleware spark_llm_auth.RequireApiKey \
@@ -828,6 +865,7 @@ write_active(){   # $1 model, $2 engine, $3 container: .active ("model engine bi
   case "$e" in
     vllm) kv+=("image=$VLLM_IMAGE" "image_id=$(docker image inspect -f '{{.Id}}' "$VLLM_IMAGE" 2>/dev/null || true)"
                "vllm_spec=$VLLM_SPEC" "gpu_util=$VLLM_GPU_UTIL" "extra=${VLLM_EXTRA:-${QWEN_EXTRA:-}}"
+               "config_fix=${VLLM_CONFIG_FIX:+cleared actorder on non-group quantization groups}"
                "vllm_version=$(kcurl -fs --max-time 5 "http://$(probe_host "$BIND"):$PORT/version" 2>/dev/null || true)") ;;
     llamacpp) kv+=("image=$LLAMA_IMAGE" "image_id=$(docker image inspect -f '{{.Id}}' "$LLAMA_IMAGE" 2>/dev/null || true)"
                    "gguf=$(basename "$(first_gguf "$(mdir "$m" llamacpp)")")" "extra=${LLAMA_EXTRA:-${TIEL_EXTRA:-}}")

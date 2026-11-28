@@ -12,6 +12,7 @@ One script to install, serve, benchmark and clean up abliterated ("uncensored") 
 | Model | Engines (default first) | Notes |
 |---|---|---|
 | `qwen27b-abl`: [Qwen3.8-27B Uncensored](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4) | `tensorfold` ([MLX 4-bit](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX)), `vllm` ([NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4)) | Dense 27B hybrid model. TensorFold drafts with [z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2); vLLM with the model's MTP head. The NVFP4 repo is gated. |
+| `qwen27b`: [Qwen3.8-27B](https://huggingface.co/RedHatAI/Qwen3.8-27B-NVFP4) (stock) | `tensorfold` ([MLX 4-bit](https://huggingface.co/mlx-community/Qwen3.8-27B-4bit)), `vllm` ([NVFP4](https://huggingface.co/RedHatAI/Qwen3.8-27B-NVFP4)) | The original model, as the baseline for the abliterated one: the same two formats (MLX affine 4-bit; NVFP4 + FP8 with the same tensors in each: NVFP4 feed-forward weights in layers 0-55, FP8 in layers 56-63 and in every attention projection, and the output layer and MTP head unquantized) and the same drafters, at the revisions measured. On vLLM the script mounts a corrected `config.json` (see [vLLM](#vllm)). |
 | `cybertiel`, `cybertiel-q8`: [CyberTiel Coder 35B-A3B](https://huggingface.co/peculiar-ragdoll/Cyber-Tiel-Coder-35B-A3B-GGUF-MTP) | `polystrata`, `llamacpp` | MoE with 3B active parameters, GGUF `UD-Q4_K_XL` or `UD-Q8_K_XL`, MTP draft head in the file. |
 | `flashnext`: [Qwen3.8-Flash-Next](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) (stock) | `polystrata`, `llamacpp` | The original model, as the baseline for the abliterated one: ISTA-DASLab's GSQ-RCO `IQ3_S` GGUF (two shards, about 84 GB) at the revision PolyStrata pins. PolyStrata drafts with DFlash2; llama.cpp runs without a drafter. PolyStrata can add its experimental refusal-direction projection (`PS_REFUSAL_PROJECTION=on`). |
 | `flashnext-abl`: [Qwen3.8-Flash-Next Uncensored](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF) | `polystrata`, `llamacpp` | OrcaRouter's `IQ3_XXS` GGUF (two shards, 85.2 GB). PolyStrata drafts with the same DFlash2 drafter as the stock model; llama.cpp drafts with OrcaRouter's separate MTP draft model (`LLAMA_ABL_MTP=off` turns it off). The repo is gated. |
@@ -21,7 +22,7 @@ Every model is served with a 262,144-token context window behind an OpenAI-compa
 The script also measures tokens per second (prefill and decode) on the running model, and can run a subset of [Cybench](https://github.com/andyzorigin/cybench) (a CTF benchmark for LLM agents) against it.
 
 > [!WARNING]
-> These models have had their refusal behavior removed. The exception is `flashnext`, the stock model, unless you turn on PolyStrata's refusal-direction projection for it (its package says the model then declines far fewer requests). Use them responsibly and only for lawful purposes, such as authorized security testing, CTFs and research. You are responsible for how you use them, and for complying with each model's license.
+> These models have had their refusal behavior removed. The exceptions are the stock models, `qwen27b` and `flashnext`; the latter unless you turn on PolyStrata's refusal-direction projection for it (its package says the model then declines far fewer requests). Use them responsibly and only for lawful purposes, such as authorized security testing, CTFs and research. You are responsible for how you use them, and for complying with each model's license.
 
 ## Results
 
@@ -32,6 +33,8 @@ Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: ev
 | Qwen3.8-27B Uncensored | vLLM, NVFP4, MTP 2 drafts (previous default) | 18.9 / 18.0 / 16.9 | 1,887 / 1,971 / 1,808 | found, first token after 259 s |
 | Qwen3.8-27B Uncensored | vLLM, NVFP4, MTP 4 drafts | 20.7 / 20.2 / 19.4 | 1,959 / 1,984 / 1,783 | found, 262 s |
 | Qwen3.8-27B Uncensored | **TensorFold**, MLX 4-bit + DFlash2 | **59.1 / 58.4 / 54.2** | 1,414 / 1,349 / 1,316 | found, **253 s** |
+| Qwen3.8-27B (stock) | vLLM, NVFP4, MTP 4 drafts | 21.2 / 19.9 / 18.7 | 1,960 / 1,993 / 1,828 | found, 261 s |
+| Qwen3.8-27B (stock) | **TensorFold**, MLX 4-bit + DFlash2 | **59.8 / 53.8 / 52.3** | 1,421 / 1,353 / 1,306 | found, **253 s** |
 | CyberTiel 35B-A3B Q4_K_XL | llama.cpp, MTP | 84.5 / 80.2 / 74.4 | 2,300 / 2,281 / 2,172 | found, 144 s |
 | CyberTiel 35B-A3B Q4_K_XL | **PolyStrata**, MTP | **97.2 / 87.6 / 85.9** | **3,648 / 3,583 / 3,491** | found, **100 s** |
 | Qwen3.8-Flash-Next (stock) IQ3_S | llama.cpp, no drafter | 31.2 / 30.8 / 30.0 | 858 / 848 / 817 | found, 276 s |
@@ -43,7 +46,7 @@ Measured on one DGX Spark (November 2026) with `speedtest.py` from this repo: ev
 
 What these show:
 
-- **Qwen3.8-27B:** TensorFold decodes about 3 times as fast as vLLM. vLLM reads prompts faster in the 4k to 32k cases, and at ~208K the two are level. vLLM's best setting is 4 MTP drafts: 6 drafts and a 16K prefill batch measured no better (prefill in the 16k and 32k cases got slower with the larger batch). TensorFold with an FP8 KV cache decoded slower (50–53 tok/s) than with the default cache.
+- **Qwen3.8-27B:** TensorFold decodes about 3 times as fast as vLLM. vLLM reads prompts faster in the 4k to 32k cases, and at ~208K the two are level. vLLM's best setting is 4 MTP drafts: 6 drafts and a 16K prefill batch measured no better (prefill in the 16k and 32k cases got slower with the larger batch). TensorFold with an FP8 KV cache decoded slower (50–53 tok/s) than with the default cache. The stock model measured like the abliterated one on both engines: within 4% in every cell except TensorFold's decode in the 16k case, 8% lower for the stock model.
 - **CyberTiel:** PolyStrata decodes 9-15% faster than llama.cpp (15% in the 4k case, 9% at 16k, 15% at 32k) and reads prompts about 60% faster, on the same GGUF file. Greedy answers to 5 fixed prompts (`--parity`) were identical on 3; the other 2 parted at a near-tie token after 65 and 160 characters, both still correct. PolyStrata's own docs note its fused kernels round slightly differently from llama.cpp's.
 - **Qwen3.8-Flash-Next:** PolyStrata is the fastest engine for both models. It decodes about twice as fast as llama.cpp without a drafter (2.0 times for the stock model, 1.6 times for the abliterated one) and 9-11% faster than llama.cpp with OrcaRouter's MTP draft model. It reads prompts 1.7 to 2.7 times as fast (the gap grows with the prompt) and answers the ~208K needle in under 2 minutes, against 4.6 to 5.1 minutes on llama.cpp. On the same file, its greedy answers to the 5 `--parity` prompts matched llama.cpp's on 4; the fifth parted after 111 characters (abliterated) and 213 (stock).
 - **OrcaRouter's MTP draft model on llama.cpp** (`flashnext-abl`): about 49% faster decoding, 6-7% slower prompt reading (the ~208K needle's first token came 10% later). The script turns it on by default.
@@ -71,7 +74,7 @@ What these show:
 - `python3` (with `venv`), `git`, `curl` and `sha256sum`
 - For PolyStrata's `strata-poly` (CyberTiel): the CUDA 13 toolkit (`/usr/local/cuda/bin/nvcc`, which DGX OS ships) and `cmake`. The build takes about 10 minutes. Qwen3.8-Flash-Next needs neither: its engine is a ready-made release.
 - About 80 GB of free disk per model and engine (90 GB for the Qwen3.8-Flash-Next models).
-- A Hugging Face account with access granted to gated repos (the Qwen NVFP4 repo and OrcaRouter's Qwen3.8-Flash-Next GGUF). The others are public.
+- A Hugging Face account with access granted to gated repos (OrcaRouter's Qwen3.8-27B NVFP4 and Qwen3.8-Flash-Next GGUF). The others are public.
 
 ## Quick start
 
@@ -108,6 +111,7 @@ The first start can take several minutes while weights load and kernels compile.
 ./spark-llm.sh --install qwen27b-abl               # the default (fastest) engine's files
 ./spark-llm.sh --start qwen27b-abl                 # stops any other model first
 ./spark-llm.sh --start qwen27b-abl --engine vllm   # another engine for the same model
+./spark-llm.sh --start qwen27b                     # the stock model, on TensorFold
 ./spark-llm.sh --install flashnext-abl             # Qwen3.8-Flash-Next Uncensored on PolyStrata (its default)
 ./spark-llm.sh --start flashnext-abl
 ./spark-llm.sh --start flashnext-abl --engine llamacpp
@@ -141,7 +145,7 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model": "CyberTiel", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-The served model names are `Qwen3.8-27B-Uncensored`, `CyberTiel`, `Qwen3.8-Flash-Next` and `Qwen3.8-Flash-Next-Uncensored`, whichever engine runs them. (PolyStrata's Flash-Next server also answers to its own set name, see below.) Any OpenAI-compatible client works with base URL `http://<spark-ip>:8000/v1` and the key above. On vLLM, Qwen runs with a reasoning parser and tool calling (`qwen3_coder`) turned on. To turn thinking off for a request, send `"chat_template_kwargs": {"enable_thinking": false}`. `--speed` sends it and flags any run that still produced reasoning.
+The served model names are `Qwen3.8-27B-Uncensored`, `Qwen3.8-27B`, `CyberTiel`, `Qwen3.8-Flash-Next` and `Qwen3.8-Flash-Next-Uncensored`, whichever engine runs them. (PolyStrata's Flash-Next server also answers to its own set name, see below.) Any OpenAI-compatible client works with base URL `http://<spark-ip>:8000/v1` and the key above. On vLLM, Qwen runs with a reasoning parser and tool calling (`qwen3_coder`) turned on. To turn thinking off for a request, send `"chat_template_kwargs": {"enable_thinking": false}`. `--speed` sends it and flags any run that still produced reasoning.
 
 ## Engines
 
@@ -178,6 +182,8 @@ TensorFold's native release (CUDA kernels embedded in the binary) serves Qwen3.8
 ### vLLM
 
 vLLM drafts with the model's MTP head, 4 tokens by default (`VLLM_SPEC`). The AEON image also contains vLLM's DFlash support, but its DFlash2 drafter failed to start there (`FlashInferImpl.__init__() got an unexpected keyword argument 'use_mm_prefix'`), so it is not the default.
+
+RedHatAI's stock NVFP4 checkpoint (`qwen27b`) records GPTQ activation ordering (`"actorder": "static"`) on its FP8 per-channel group, and the compressed-tensors version in the image refuses that at startup ("Must use group or tensor_group quantization strategy in order to apply activation ordering"). Static ordering only changes how the weights were calibrated, not how they are stored, and vLLM's FP8 and NVFP4 kernels do not read it. So the script writes a copy of `config.json` with only those flags cleared (`$SPARK_LLM_HOME/vllm-config/`) and mounts it over the original in the container. The downloaded files stay as the Hub has them, and models that need no correction get none. `--speed` records the correction as `config_fix`.
 
 ## Configuration
 
@@ -270,6 +276,7 @@ Keep these caveats in mind:
 ├── polystrata-data/    # packs, run configs and the DFlash2 drafter (dflash2/)
 ├── tensorfold/         # TensorFold release
 ├── vllm-auth/          # the key-checking middleware mounted into the vLLM container
+├── vllm-config/        # corrected config.json copies mounted over a checkpoint's own, where one is needed
 ├── venv/               # Hugging Face CLI
 ├── speed/              # speed and parity results (JSON)
 ├── logs/               # native engines' server logs
@@ -295,12 +302,12 @@ Keep these caveats in mind:
 - Every inference route of every engine needs the key. vLLM's own key check covers only `/v1`, `/v2`, `/inference` and `/cohere`, and its `POST /invocations` would serve the model without one, so the script mounts a small middleware into the vLLM container (`$SPARK_LLM_HOME/vllm-auth/spark_llm_auth.py`, loaded with `--middleware`) that requires the key on every route except `/health` and `/ping`. After every start the script proves it: POSTs without a key and with a wrong key to `/v1/chat/completions` (and, on vLLM, `/invocations`) must get 401 or 403, and other inference paths must refuse too or not exist. Otherwise the script stops the server and exits with an error. Health checks, and llama.cpp's model list (`/v1/models`), answer without a key.
 - The API key, and Cybench's `.env` that contains it, are written with mode `600`, are never printed (not even by `--dry-run`), and never appear on a command line: vLLM reads it from `VLLM_API_KEY` in its container's environment, llama.cpp and TensorFold from the key file (`--api-key-file`; read-only mount for llama.cpp), PolyStrata from `STRATA_API_KEY`, and the script's own `curl` checks from standard input (`curl -K -`). Members of the `docker` group can still read it with `docker inspect`, but that group is equivalent to root anyway.
 - The script never stores or logs your Hugging Face token. The native engines start with a reduced environment (paths, locale, CUDA/NVIDIA, Python and engine variables), so your token and other credentials exported in the shell do not reach them. PolyStrata's install tools (its updater, drafter fetch and pack tool) run like `pip` does, with your shell's environment.
-- What is pinned: PolyStrata's source (a commit of our fork, `PS_REF`); the Strata engine (the signed package of that release's update feed: PolyStrata's updater checks the signature, and every start checks each file against the package's manifest); the DFlash2 drafter (PolyStrata's pinned size and SHA-256; a start refuses a file that does not match); the stock Qwen3.8-Flash-Next files (the Hugging Face revision PolyStrata pins); and TensorFold's release tarball (its SHA-256, `TF_SHA256`, recorded in the script; another `TF_VERSION` needs its own `TF_SHA256`). What is not: the container images are pulled by tag (set `VLLM_IMAGE` / `LLAMA_IMAGE` to `image@sha256:<digest>` to pin them; `docker image inspect --format '{{index .RepoDigests 0}}' <image>` prints the digest you have), the Hugging Face CLI and `ninja` come from PyPI unpinned, PolyStrata's Python requirements and the CUDA wheels by version but without hashes, OrcaRouter's Qwen3.8-Flash-Next files at the repo's current revision, and vLLM runs with `--trust-remote-code` on the model repo.
+- What is pinned: PolyStrata's source (a commit of our fork, `PS_REF`); the Strata engine (the signed package of that release's update feed: PolyStrata's updater checks the signature, and every start checks each file against the package's manifest); the DFlash2 drafter (PolyStrata's pinned size and SHA-256; a start refuses a file that does not match); the stock Qwen3.8-Flash-Next files (the Hugging Face revision PolyStrata pins); the stock Qwen3.8-27B files (the revisions measured); and TensorFold's release tarball (its SHA-256, `TF_SHA256`, recorded in the script; another `TF_VERSION` needs its own `TF_SHA256`). What is not: the container images are pulled by tag (set `VLLM_IMAGE` / `LLAMA_IMAGE` to `image@sha256:<digest>` to pin them; `docker image inspect --format '{{index .RepoDigests 0}}' <image>` prints the digest you have), the Hugging Face CLI and `ninja` come from PyPI unpinned, PolyStrata's Python requirements and the CUDA wheels by version but without hashes, OrcaRouter's Qwen3.8-Flash-Next files at the repo's current revision, and vLLM runs with `--trust-remote-code` on the model repo.
 - Cybench task containers run with `--privileged`, as upstream does. Run benchmarks only on a machine you're comfortable using for that.
 
 ## Acknowledgements
 
-- Model authors: [orcarouter](https://huggingface.co/orcarouter) (Qwen3.8-27B Uncensored, Qwen3.8-Flash-Next Uncensored) and [peculiar-ragdoll](https://huggingface.co/peculiar-ragdoll) (CyberTiel), building on the Qwen base models; [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) (Qwen3.8-Flash-Next GSQ-RCO GGUF); [z-lab](https://huggingface.co/z-lab) (Qwen3.8-27B DFlash2 drafter) and [incoai](https://huggingface.co/incoai) (Qwen3.8-Flash-Next DFlash2 drafter, tuned by PolyStrata)
+- Model authors: [orcarouter](https://huggingface.co/orcarouter) (Qwen3.8-27B Uncensored, Qwen3.8-Flash-Next Uncensored) and [peculiar-ragdoll](https://huggingface.co/peculiar-ragdoll) (CyberTiel), building on the Qwen base models; [ISTA-DASLab](https://huggingface.co/ISTA-DASLab) (Qwen3.8-Flash-Next GSQ-RCO GGUF); [RedHatAI](https://huggingface.co/RedHatAI) and [mlx-community](https://huggingface.co/mlx-community) (stock Qwen3.8-27B NVFP4 and MLX 4-bit); [z-lab](https://huggingface.co/z-lab) (Qwen3.8-27B DFlash2 drafter) and [incoai](https://huggingface.co/incoai) (Qwen3.8-Flash-Next DFlash2 drafter, tuned by PolyStrata)
 - [vLLM](https://github.com/vllm-project/vllm) and the AEON DGX Spark build
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)
 - [PolyStrata](https://github.com/simplexai-labs/PolyStrata) and [Strata](https://github.com/Niko1221/Strata)
