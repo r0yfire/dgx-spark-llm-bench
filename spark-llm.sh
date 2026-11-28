@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 # spark-llm.sh - install, run, benchmark and clean up open-weight models on an NVIDIA DGX Spark.
 #
-# Models (see `--list`) run on one of five engines, one model at a time, behind an OpenAI-compatible API on :8000
+# Models (see `--list`) run on one of seven engines, one model at a time, behind an OpenAI-compatible API on :8000
 # (bearer key required on every inference route; checked at each start). Each engine reads its own format of the same weights:
 #   vllm        vLLM, Spark build (AEON image)               NVFP4 checkpoints
+#   vllm-flash  vLLM v0.33, blazux's Flash-Next recipe        Qwen3.8-Flash-Next ModelOpt NVFP4 (image built here from the recipe)
 #   llamacpp    llama.cpp server (CUDA 13, arm64)            GGUF
 #   polystrata  PolyStrata (r0yfire fork), natively           GGUF MoE models: CyberTiel on strata-poly (built here for GB10),
 #                                                            Qwen3.8-Flash-Next on the Strata engine (signed release) + DFlash2
 #   strata      Strata v0.2.13 (Niko1221/Strata), natively   DeepSeek-V4.1-Flash-1017 GGUF on its own engine, strata-dsv41
 #                                                            (signed release), with the DSpark drafter
-#   tensorfold  TensorFold native release (CUDA, sm_121)     MLX 4-bit checkpoints + DFlash2 drafter, natively
+#   tensorfold  TensorFold native release (CUDA, sm_121)     MLX 4-bit checkpoints, natively: the 27B with the DFlash2 drafter,
+#                                                            Flash-Next with its own MTP head
+#   velogb10    veloGB10 native release (GB10 only)          EXL3 checkpoints with their MTP head, natively, behind auth-proxy.py
+#                                                            (the engine has no API-key option)
 # Interactive menu by default. Flags for scripting:
 #   --list                                    models and the engines each one runs on
-#   --install MODEL [--engine E]              download weights + the engine (image, PolyStrata build, Strata or TensorFold release)
+#   --install MODEL [--engine E]              download weights + the engine (image, image build, PolyStrata build, or a Strata,
+#                                             TensorFold or veloGB10 release)
 #   --start   MODEL [--engine E]              (re)start that model; E defaults to the model's first engine
 #   --stop | --status
 #   --speed [cases]                           tokens/s of the running model (prefill + decode), see speedtest.py
@@ -81,11 +86,15 @@ YES=0; DRY=0
 
 # Model registry, one row per (model, engine): each engine reads its own format of the same weights.
 #   key|engine|title|HF repo[@revision]|--include pattern ("," separates several)|folder under models/|served name
-# A model's first row is its default engine: the fastest one measured on the Spark (README, "Results").
+# A model's first row is its default engine (README, "Results", says what each engine measured on the Spark).
 # Flash-Next stock: the GSQ-RCO files at the revision PolyStrata's setup.py pins (HF_REVISIONS), so they are the bytes it checks.
 # Qwen3.8-27B stock: the baseline for the abliterated model, in the same two formats (MLX affine 4-bit with group size 64, and
 # compressed-tensors NVFP4 + FP8 with the same layer split and the MTP head unquantized), pinned to the revisions measured.
 # The NVFP4 one needs a corrected config.json on vLLM (vllm_config_fix).
+# Flash-Next abliterated (OrcaRouter's abliteration) also comes in three formats that one engine each reads, pinned to the
+# revisions measured: yikoudazhong's MLX affine 4-bit (group size 32) with the model's MTP head, on TensorFold; Lygodactylus's
+# EXL3 3.05 bpw (5-bit output layer, 3-bit MTP head and n-gram table), on veloGB10; and jpezzulli's ModelOpt NVFP4 (routed
+# experts in NVFP4, the rest BF16, the n-gram table FP8, in RadixArk's layout), on blazux's vLLM recipe.
 # DeepSeek-V4.1-Flash-1017: the 2.00 bpw IQ2_XXS sets, ISTA-DASLab's (stock, the revision Strata v0.2.13 pins) and AtomicChat's
 # abliterated one, whose shards 1-3 are ISTA's byte for byte. The pattern names the shards; st_install fetches them one by one.
 MODELS=(
@@ -101,6 +110,9 @@ MODELS=(
  "flashnext|llamacpp|Qwen3.8-Flash-Next IQ3_S (GSQ-RCO)|ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF@ed59f92082b1e93c0e96d60a8b11aab089b52f09|IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-0000*|flashnext-iq3s|Qwen3.8-Flash-Next"
  "flashnext-abl|polystrata|Qwen3.8-Flash-Next Uncensored IQ3_XXS + DFlash2|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
  "flashnext-abl|llamacpp|Qwen3.8-Flash-Next Uncensored IQ3_XXS|orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF|Qwen3.8-Flash-Next-Uncensored-IQ3_XXS-0000*,Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf|flashnext-abl-iq3xxs|Qwen3.8-Flash-Next-Uncensored"
+ "flashnext-abl|tensorfold|Qwen3.8-Flash-Next Uncensored, MLX 4-bit + MTP|yikoudazhong/Qwen3.8-Flash-Next-Uncensored-TF-4bit-MTP@ac9302764c83c737da4ea9984cf434a41fea0082||flashnext-abl-tf4bit-mtp|Qwen3.8-Flash-Next-Uncensored"
+ "flashnext-abl|velogb10|Qwen3.8-Flash-Next Uncensored, EXL3 3.05 bpw + MTP|Lygodactylus/Qwen3.8-Flash-Next-Uncensored-exl3-3bpw@fe57295cac48562c0de8dc5cbf4d7b26c0ebd26d||flashnext-abl-exl3-3bpw|Qwen3.8-Flash-Next-Uncensored"
+ "flashnext-abl|vllm-flash|Qwen3.8-Flash-Next Uncensored, ModelOpt NVFP4 + MTP|jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664||flashnext-abl-modelopt-nvfp4|Qwen3.8-Flash-Next-Uncensored"
  "deepseek41|strata|DeepSeek-V4.1-Flash-1017 IQ2_XXS (GSQ-RCO)|ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF@cb02422c900df489cea5833e8a92171224059b3c|DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000?-of-00004.gguf|deepseek41/ista-iq2xxs|DeepSeek-V4.1-Flash-1017"
  "deepseek41-abl|strata|DeepSeek-V4.1-Flash-1017 Uncensored IQ2_XXS|AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF@4f1d2f730cff977961db81789e81bfc0d3e6dd2e|DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000?-of-00004.gguf|deepseek41/atomic-iq2xxs|DeepSeek-V4.1-Flash-1017-Uncensored"
 )
@@ -112,6 +124,30 @@ DRAFTER_27B_REPO="${DRAFTER_27B_REPO:-z-lab/Qwen3.8-27B-DFlash2}"
 TF_VERSION="${TF_VERSION:-1.3.6}"; TF_DIR="$BASE/tensorfold"; TF_PID="$BASE/.tensorfold.pid"
 TF_SHA256_1_3_6=7f9790480e0a0f4baef73eaf0a5168ffee6d0ddb0e8f11102908f7894d14eb32
 TF_SHA256="${TF_SHA256:-}"; if [ -z "$TF_SHA256" ] && [ "$TF_VERSION" = 1.3.6 ]; then TF_SHA256=$TF_SHA256_1_3_6; fi
+# TensorFold's retained-prefix budget (--prompt-cache-gib), the cache that lets a conversation's next turn read only its new
+# tokens. Unset: TensorFold's own default, except Flash-Next (tf_start). 0 turns the cache off.
+TF_PROMPT_CACHE_GIB="${TF_PROMPT_CACHE_GIB:-}"
+# veloGB10 (sf-stav/veloGB10): native release for the GB10 (sm_121), pinned by version AND by the tarball's SHA-256 recorded here
+# (the same value as the release's SHA256SUMS line; the release's own file is never what the download is checked against).
+# It has no API-key option, so it listens on 127.0.0.1:VG_PORT only and auth-proxy.py (beside this script) serves BIND:PORT,
+# refusing any request without the key.
+VG_VERSION=v0.8.1; VG_DIR="$BASE/velogb10"; VG_PID="$BASE/.velogb10.pid"; VG_PROXY_PID="$BASE/.velogb10-proxy.pid"
+VG_TARBALL="velogb10-$VG_VERSION-gb10-sm121.tar.gz"
+VG_SHA256=109a53c41e0d79e0b740bf0bb4efee074026275750fc9ba7c4f373c8c92d635b
+VG_PORT="${VG_PORT:-8001}"        # the engine's own port, on 127.0.0.1 only
+VG_MAX_CTX=262144                 # veloGB10 serves Flash-Next up to its native 262,144 tokens (no YaRN)
+VG_PREFIX_CACHE="${VG_PREFIX_CACHE:-on}"   # reuse a conversation's prefix on its next turn (vg_start says why it is on)
+# vllm-flash: vLLM v0.33 as blazux's qwen3.8-Flash-DGX recipe builds it for Qwen3.8-Flash-Next on one Spark (its patches map the
+# 47.7 GiB n-gram table from disk instead of holding it in memory). A separate engine from `vllm`, whose AEON image stays as it is.
+# Pinned: the recipe's commit, and through it the base image (its Dockerfile names vllm/vllm-openai v0.33.0 by digest, which the
+# install checks) and every file its Dockerfile adds (by --checksum). The image is built here and tagged with the commit.
+VF_REPO=https://github.com/blazux/qwen3.8-Flash-DGX.git
+VF_REF=01731a10c93dfab07ec6fabf6a30cde7f4bfc25d
+VF_BASE=vllm/vllm-openai:v0.33.0@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e
+VF_IMAGE="qwen38-flash-dgx:v0.33-${VF_REF:0:8}"
+VF_DIR="$BASE/blazux"; VF_HF="$BASE/blazux-hf"   # the recipe's checkout; the Hugging Face cache layout its serve.sh reads
+VF_MAX_CTX=262144                                # the model's native window (the recipe's YaRN option is not used)
+VF_KV_DTYPE="${VF_KV_DTYPE:-fp8_e4m3}"           # the measured "fast" profile's KV cache; auto = bf16 (serve.sh's own default)
 
 # Fixed Cybench subset: 10 tasks from the official task_list.txt that run on the aarch64 Spark. Excluded: tasks shipping x86-64
 # binaries/services (no amd64 emulation / x86 disassembler) and tasks whose Docker build fails on archived Debian repos (apt 404).
@@ -183,7 +219,7 @@ hf_cli(){
   fi
 }
 
-is_docker_engine(){ case "$1" in vllm|llamacpp) return 0;; *) return 1;; esac; }
+is_docker_engine(){ case "$1" in vllm|vllm-flash|llamacpp) return 0;; *) return 1;; esac; }
 need_docker(){
   need docker
   docker info >/dev/null 2>&1 || die "cannot talk to Docker (is $USER in the docker group?)"
@@ -196,7 +232,16 @@ preflight(){   # $1 engine (optional), $2 GB the install needs (default 80): bef
   free=$(df -BG --output=avail "$d" | tail -1 | tr -dc 0-9)
   [ "${free:-0}" -ge "$want" ] || die "need ~$want GB free in $BASE (have ${free:-?} GB)"
 }
-disk_gb(){ case "$1" in deepseek41*) st_need_gb "$1";; flashnext*) echo 90;; *) echo 80;; esac; }   # $1 model: GB an install needs (Flash-Next: 85 GB of GGUF + pack, engine)
+disk_gb(){   # $1 model, $2 engine: GB an install needs
+  case "$1:$2" in
+    deepseek41*) st_need_gb "$1" ;;
+    flashnext-abl:tensorfold) echo 115 ;;   # 107 GB of MLX 4-bit shards, the engine
+    flashnext-abl:velogb10) echo 75 ;;      # 68 GB of EXL3, the engine
+    flashnext-abl:vllm-flash) echo 175 ;;   # 135 GB of ModelOpt NVFP4, 13 GB of fp8 side layers, the image (26 GB)
+    flashnext*) echo 90 ;;                  # 85 GB of GGUF, a pack, the engine
+    *) echo 80 ;;
+  esac
+}
 
 download(){   # $1 model, $2 engine
   local spec repo rev="" inc p; spec=$(field "$1" "$2" 4); inc=$(field "$1" "$2" 5)
@@ -214,7 +259,7 @@ drafter_27b(){ echo "$BASE/models/qwen27b-dflash2"; }
 needs_drafter(){ [[ "$1" == qwen27b* ]] && { [ "$2" = tensorfold ] || [[ "$2" = vllm && "$VLLM_SPEC" == *dflash* ]]; }; }
 
 install_model(){   # $1 model, $2 engine (optional)
-  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight "$e" "$(disk_gb "$m")"; hf_cli
+  local m e; m=$(norm "$1"); e=$(engine_for "$m" "${2:-}"); preflight "$e" "$(disk_gb "$m" "$e")"; hf_cli
   [ "$e" = strata ] || download "$m" "$e"   # (Strata's files: st_install, one pinned file at a time)
   if needs_drafter "$m" "$e"; then
     say "Downloading the DFlash2 drafter ($DRAFTER_27B_REPO)"
@@ -226,6 +271,8 @@ install_model(){   # $1 model, $2 engine (optional)
     polystrata) ps_install "$m" ;;
     strata) st_install "$m" ;;
     tensorfold) tf_install ;;
+    velogb10) vg_install ;;
+    vllm-flash) vf_install "$m" ;;
     *) die "engine '$e' is not wired into install_model" ;;
   esac
   say "Installed $m ($e)"
@@ -703,12 +750,13 @@ st_start(){   # $1 model, $2 run config from st_config
       .venv/bin/python serve/server.py --engine strata --config "$cfg" --host "$BIND" --port "$PORT" )
 }
 
-# ---------------------------------------------------------------- native engines (PolyStrata, Strata, TensorFold)
+# ---------------------------------------------------------------- native engines (PolyStrata, Strata, TensorFold, veloGB10)
 # A native server runs in its own session, so --stop can end it and every process it spawned together.
 # The PID file holds "PID START": the session leader's PID (`exec` makes it the server itself, not a wrapper shell)
 # and its start time from /proc. Both must match, and the command line must contain the marker below, before
 # anything is signaled: a PID file that outlived its server (a reboot, a crash) must not get an unrelated process killed.
 PS_MARK="$PS_DATA/strata-"; ST_MARK="$ST_DIR/spark-llm-"; TF_MARK="$TF_DIR/"   # in the server's argv: its config path / its executable path
+VG_MARK="$VG_DIR/velogb10/gb10_inference"; VG_PROXY_MARK="auth-proxy.py --listen"   # veloGB10's executable / its key proxy
 
 # Native servers get only this environment, so credentials exported in the calling shell (HF_TOKEN, cloud keys,
 # OPENAI_API_KEY...) do not reach third-party code. Unset in a subshell: no value ever goes through an argv.
@@ -799,16 +847,100 @@ tf_model_path(){   # $1 model: a pattern like "4-bit/*" means the model is that 
   if [[ "$inc" == */* ]]; then echo "$dir/${inc%%/*}"; else echo "$dir"; fi
 }
 
+# Flash-Next on TensorFold's CUDA build (docs/recipes/flash-next-cuda.md at v1.3.6) keeps a conversation's state only in its
+# prompt cache: "The core's prompt cache keeps and resumes a stream's state ... with the MTP head's cache rows for a drafting
+# stream", and after a reply a background pass "prefills the reply as the next turn's prompt renders it ... so the next turn
+# resumes past the reply". With --prompt-cache-gib 0 every turn of an agent reads its whole conversation again. That doc's
+# "evaluate with --prompt-cache-gib 0" is for its experimental ModelOpt and two-rank path, not this MLX 4-bit one. The cost
+# (docs/known-issues.md): the 29.8 GiB of n-gram tables are read through the page cache, and "as saved prompt states (up to
+# 16 GiB by default) fill, time to first token on a new prompt of about 65,000 tokens rises from 34 s to about 38 s". So the
+# budget here is 8 GiB, not the default: room for one full 262,144-token stream's state (7.99 GiB at startup on the Spark),
+# with 8 GiB more of the page cache left to the tables. TF_FLASHNEXT_CHUNK_SOLO=8192 is the prompt pass size that --parallel 1
+# gives on one GPU anyway (docs/environment.md), set so the run does not depend on that default.
+tf_env(){ case "$1" in flashnext*) echo "TF_FLASHNEXT_CHUNK_SOLO=8192";; *) echo "";; esac; }   # $1 model -> NAME=VALUE ...
+tf_prompt_cache(){   # $1 model -> the --prompt-cache-gib value, or nothing for TensorFold's default
+  if [ -n "$TF_PROMPT_CACHE_GIB" ]; then echo "$TF_PROMPT_CACHE_GIB"; return; fi
+  case "$1" in flashnext*) echo 8;; *) echo "";; esac
+}
+
 tf_start(){   # $1 model
-  local m=$1 path drafter=()
+  local m=$1 path drafter=() env=() cache=() gib shown="TensorFold's default"
   path=$(tf_model_path "$m")
   if needs_drafter "$m" tensorfold; then drafter=(--drafter "$(drafter_27b)"); fi
-  [ "$DRY" = 1 ] && { say "(dry run: would serve $path on TensorFold, $BIND:$PORT)"; return; }
-  say "Starting $(field "$m" tensorfold 3) on TensorFold $TF_VERSION (${CTX} ctx)"
+  gib=$(tf_prompt_cache "$m"); if [ -n "$gib" ]; then cache=(--prompt-cache-gib "$gib"); shown="$gib GiB"; fi
+  read -ra env <<<"$(tf_env "$m")"
+  [ "$DRY" = 1 ] && { say "(dry run: would serve $path on TensorFold, $BIND:$PORT, ${CTX} ctx, prompt cache $shown${env[*]:+, ${env[*]}})"; return; }
+  say "Starting $(field "$m" tensorfold 3) on TensorFold $TF_VERSION (${CTX} ctx, prompt cache $shown)"
+  # The engine's own variables go through `env`: native_launch passes on only a short list of the caller's variables.
   # shellcheck disable=SC2086   # TF_EXTRA is a list of extra arguments
-  native_launch "$TF_PID" "$BASE/logs/tensorfold-$m.log" "$(tf_bin)" serve "$path" "${drafter[@]}" \
-    --context "$CTX" --parallel 1 --host "$BIND" --port "$PORT" --api-key-file "$KEYFILE" \
+  native_launch "$TF_PID" "$BASE/logs/tensorfold-$m.log" env "${env[@]}" "$(tf_bin)" serve "$path" "${drafter[@]}" \
+    --context "$CTX" --parallel 1 "${cache[@]}" --host "$BIND" --port "$PORT" --api-key-file "$KEYFILE" \
     --name "$(served "$m" tensorfold)" --no-update-check ${TF_EXTRA:-}
+}
+
+# ---------------------------------------------------------------- veloGB10 (native, not Docker)
+vg_bin(){ echo "$VG_DIR/velogb10/gb10_inference"; }
+vg_proxy(){ echo "$SCRIPT_DIR/auth-proxy.py"; }
+
+vg_install(){
+  [ -x "$(vg_bin)" ] && { say "veloGB10 $VG_VERSION already installed"; return; }
+  need curl; need sha256sum
+  local u="https://github.com/sf-stav/veloGB10/releases/download/$VG_VERSION"
+  say "Installing veloGB10 $VG_VERSION (native, GB10 only)"
+  if [ "$DRY" = 1 ]; then
+    run mkdir -p "$VG_DIR"; run curl -fsSL -o "$VG_DIR/$VG_TARBALL" "$u/$VG_TARBALL"
+    printf '+ %s\n' "check sha256 of $VG_DIR/$VG_TARBALL is $VG_SHA256" "tar -xzf $VG_DIR/$VG_TARBALL -C $VG_DIR"
+    return
+  fi
+  mkdir -p "$VG_DIR"
+  curl -fsSL -o "$VG_DIR/$VG_TARBALL" "$u/$VG_TARBALL" || die "veloGB10 download failed ($u/$VG_TARBALL)"
+  ( cd "$VG_DIR" && printf '%s  %s\n' "$VG_SHA256" "$VG_TARBALL" | sha256sum -c --quiet - ) ||
+    { rm -f "$VG_DIR/$VG_TARBALL"; die "veloGB10 $VG_VERSION tarball does not match the pinned SHA-256 ($VG_SHA256); deleted it"; }
+  tar -xzf "$VG_DIR/$VG_TARBALL" -C "$VG_DIR" || die "could not unpack $VG_DIR/$VG_TARBALL"
+  [ -x "$(vg_bin)" ] || die "the veloGB10 $VG_VERSION tarball has no $(vg_bin)"
+}
+
+# The engine runs from its release folder, as its setup guide runs it, with the flags of the guide's one-GB10 command: one lane,
+# the model's full window, MTP drafting (--mtp auto, the default) and the n-gram table in RAM when it fits (--ple-ram auto). No thinking override: the chat template decides, and a request can still turn it off. veloGB10
+# refuses to start with any GB10_* variable set; native_launch passes none. The prefix cache (`--help`, PREFIX CACHE):
+# "Reuse a conversation's cached prefix instead of re-prefilling it - ~3x faster follow-up turns on multi-turn/agent traffic.
+# NOT bit-exact: ... a cached turn can word an answer differently than a cold one. Greedy MTP stays lossless." It is off by
+# default; an agent re-sends its whole conversation every turn, so it is on here (VG_PREFIX_CACHE=off restores the default).
+# Its companions keep their defaults, which suit one lane at 262,144 tokens: --prefix-ckpt-mem-gb 4 ("GiB cap (LRU) of the
+# intermediate prefill checkpoints ... a new chat on a shared system prompt resumes from the deepest aligned checkpoint ...
+# bit-identical to a fresh prefill"), and --prefix-pool-gb 32 (--help-advanced: when a new conversation takes over a lane,
+# "copy the old conversation's prompt state ... into a pool"; "a copy never takes the machine below --prefix-pool-floor-gb of
+# free memory", 20 GiB), so an agent's side request (a summary, a sub-agent) does not cost the main conversation its cache on
+# one lane. --df2-carry stays off: it keeps a DFlash2 drafter across a cache hit, and this model drafts with its MTP head.
+vg_start(){   # $1 model
+  local m=$1 dir t=0; dir=$(mdir "$m" velogb10)
+  if [ "$DRY" = 1 ]; then
+    say "(dry run: would serve $dir on veloGB10 $VG_VERSION at 127.0.0.1:$VG_PORT (${CTX} ctx, prefix cache $VG_PREFIX_CACHE), behind auth-proxy.py on $BIND:$PORT)"
+    return
+  fi
+  while ss -ltn "( sport = :$VG_PORT )" | grep -q LISTEN; do
+    [ $t -ge 10 ] && die "port $VG_PORT (VG_PORT, veloGB10's own) is in use by another program (ss -ltnp)"; sleep 1; t=$((t+1)); done
+  say "Starting $(field "$m" velogb10 3) on veloGB10 $VG_VERSION (${CTX} ctx, prefix cache $VG_PREFIX_CACHE), key check by auth-proxy.py"
+  # shellcheck disable=SC2086   # VG_EXTRA is a list of extra arguments
+  native_launch "$VG_PID" "$BASE/logs/velogb10-$m.log" env -C "$VG_DIR/velogb10" "$(vg_bin)" --server --model-dir "$dir" \
+    --host 127.0.0.1 --port "$VG_PORT" --max-seq-len "$CTX" --max-batch 1 --mtp auto --ple-ram auto \
+    --prefix-cache "$VG_PREFIX_CACHE" --served-model-name "$(served "$m" velogb10)" --no-update-check ${VG_EXTRA:-}
+  # The proxy reads the key from the key file (never an argv) and answers 401 without it on every route but GET /health.
+  native_launch "$VG_PROXY_PID" "$BASE/logs/velogb10-proxy.log" python3 -I -u "$(vg_proxy)" \
+    --listen "$BIND:$PORT" --upstream "http://127.0.0.1:$VG_PORT" --key-file "$KEYFILE"
+}
+vg_stop(){ native_stop "$VG_PROXY_PID" "veloGB10's key proxy" "$VG_PROXY_MARK"; native_stop "$VG_PID" veloGB10 "$VG_MARK"; }
+
+vg_served_ctx(){   # the context veloGB10 serves (max_model_len in /v1/models), or nothing when it does not answer
+  kcurl -fs --max-time 10 "http://$(probe_host "$BIND"):$PORT/v1/models" 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][0].get("max_model_len", ""))' 2>/dev/null || true
+}
+# veloGB10 does not refuse a context it cannot hold: when one lane does not fit, it serves a shorter one (its v0.7.9 changelog).
+vg_check_ctx(){   # $1 model
+  local n; n=$(vg_served_ctx)
+  if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -lt "$CTX" ]; then
+    say "WARNING: veloGB10 serves $n tokens, not the $CTX asked for: one lane of $CTX did not fit (see $BASE/logs/velogb10-$1.log)"
+  fi
 }
 
 # ---------------------------------------------------------------- vLLM key check for every route
@@ -900,6 +1032,100 @@ elif dry != "1" and os.path.exists(dst):
 PY
 }
 
+# ---------------------------------------------------------------- vLLM, blazux's Flash-Next recipe (vllm-flash)
+# The recipe's own scripts/serve.sh starts the container, unmodified at the pinned commit, so the server is the one its
+# documentation measured: it reads the checkpoint from a Hugging Face cache layout (vf_snapshot) and maps the n-gram table
+# from disk. The settings are the recipe's "fast" profile (profiles/mtp-fast.env) at the native 262,144-token window: up to 16
+# sequences, a bfloat16 recurrent-state cache, an fp8 KV cache of 13 GiB, 3 MTP drafts with the draft head's output layer in
+# NVFP4 over the full vocabulary, 16,384-token batches. MODE=hybrid serves the checkpoint with its BF16 side layers converted
+# to blockwise fp8 by the recipe's own converter (tools/fp8_convert.py, what its scripts/prepare-hybrid.sh runs), once, at
+# install; the routed experts and the MTP head are untouched. serve.sh keeps vLLM's prefix caching on (its PREFIX_CACHE=1
+# default), so an agent's next turn reads only its new tokens. It starts the container with --restart unless-stopped: --stop
+# removes it, but a container still running when the machine shuts down starts again with Docker.
+# VF_KV_DTYPE=auto serves the KV cache in bf16 instead (serve.sh: fp8_e4m3 holds about 1.9 times as many tokens in the same
+# memory); that setting was not measured here.
+VF_SETTINGS="SEQS=16 MAMBA_SSM_DTYPE=bfloat16 KV_DTYPE=$VF_KV_DTYPE KV_CACHE_MEM=13958643712 MTP=3 DRAFT_VOCAB=0 MTP_DRAFT_QUANT=nvfp4 BATCH_TOKENS=16384"
+VF_MODE=hybrid
+
+vf_repo(){ local s; s=$(field "$1" vllm-flash 4); echo "${s%%@*}"; }        # $1 model -> its Hugging Face repo
+vf_cache_dir(){ local r; r=$(vf_repo "$1"); echo "$VF_HF/hub/models--${r//\//--}"; }
+vf_snap(){ echo "$(vf_cache_dir "$1")/snapshots/local"; }                    # the checkpoint as published
+vf_hyb(){ echo "$(vf_cache_dir "$1")/snapshots/local-fp8hybrid"; }           # with fp8 side layers (MODE=hybrid)
+vf_image_ok(){ [ "$(docker image inspect -f '{{index .Config.Labels "qwen38.base"}}' "$VF_IMAGE" 2>/dev/null)" = v0.33 ]; }
+vf_ref_ok(){ [ "$(git -C "$VF_DIR" rev-parse HEAD 2>/dev/null)" = "$VF_REF" ]; }
+
+# The cache layout serve.sh expects: refs/main names the snapshot "local"; in a snapshot the small files are copies and every
+# *.safetensors is a link to /src/<name>, the read-only mount of the model folder in the container (so nothing is copied).
+vf_snapshot(){   # $1 model, $2 snapshot dir: (re)create it
+  local d=$2 f
+  run rm -rf "$d"; run mkdir -p "$d" "$(vf_cache_dir "$1")/refs"
+  if [ "$DRY" = 1 ]; then printf '+ %s\n' "copy the small files of $(mdir "$1" vllm-flash) into $d, link each *.safetensors to /src/<name>"; return; fi
+  echo local > "$(vf_cache_dir "$1")/refs/main"
+  for f in "$(mdir "$1" vllm-flash)"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in *.safetensors) ln -s "/src/${f##*/}" "$d/${f##*/}" ;; *) cp "$f" "$d/" ;; esac
+  done
+}
+
+vf_install(){   # $1 model: the recipe at its commit, its image, the cache layout, the fp8 side layers. Each step is skipped when done.
+  local m=$1 hyb; hyb=$(vf_hyb "$1"); need git
+  if vf_ref_ok; then say "blazux's recipe already at $VF_REF"; else
+    say "Fetching blazux's qwen3.8-Flash-DGX recipe at $VF_REF"
+    [ -d "$VF_DIR/.git" ] || run git clone -q "$VF_REPO" "$VF_DIR"
+    run git -C "$VF_DIR" fetch -q origin
+    run git -C "$VF_DIR" -c advice.detachedHead=false checkout -q --force "$VF_REF"
+  fi
+  [ "$DRY" = 1 ] || grep -qF "FROM $VF_BASE" "$VF_DIR/Dockerfile" || die "the recipe's Dockerfile does not start FROM $VF_BASE"
+  local build=(docker build -t "$VF_IMAGE" "$VF_DIR") log=$BASE/logs/vllm-flash-build.log
+  if vf_image_ok; then say "Image $VF_IMAGE already built"
+  elif [ "$DRY" = 1 ]; then printf '+ %s\n' "${build[*]} > $log"
+  else
+    say "Building $VF_IMAGE from the recipe's Dockerfile ($log)"
+    "${build[@]}" > "$log" 2>&1 || { tail -20 "$log"; die "the image build failed (see $log)"; }
+  fi
+  if [ -s "$(vf_snap "$m")/config.json" ]; then say "The recipe's cache layout is in place ($(vf_snap "$m"))"; else vf_snapshot "$m" "$(vf_snap "$m")"; fi
+  if [ -f "$hyb/.prepared" ]; then say "fp8 side layers already prepared ($hyb)"; return; fi
+  say "Converting the BF16 side layers to blockwise fp8 (the recipe's tools/fp8_convert.py, 13 GB)"
+  vf_snapshot "$m" "$hyb"
+  local conv=(docker run --rm --name spark-llm-fp8convert -v "$(mdir "$m" vllm-flash):/src:ro" -v "$hyb:/dst" -v "$VF_DIR/tools:/tools:ro"
+              --entrypoint python3 "$VF_IMAGE" /tools/fp8_convert.py /dst)
+  log=$BASE/logs/vllm-flash-fp8convert.log
+  if [ "$DRY" = 1 ]; then printf '+ %s\n' "${conv[*]} > $log"; return; fi
+  "${conv[@]}" > "$log" 2>&1 || { tail -15 "$log"; die "the fp8 conversion failed (see $log)"; }
+  python3 -c 'import json, sys; sys.exit(not any(k.endswith("weight_scale_inv") for k in json.load(open(sys.argv[1]))["weight_map"]))' \
+    "$hyb/model.safetensors.index.json" || die "the converted index names no fp8 weight scales: the conversion did not take"
+  touch "$hyb/.prepared"
+}
+
+# serve.sh reads many optional variables from its environment (CC among them, which it would take as vLLM's compile config),
+# so it runs with only these, the key (exported for -e VLLM_API_KEY, which copies it into the container) and its settings.
+vf_env_keep(){ case "$1" in PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|TERM|TZ|TMPDIR|LC_*|DOCKER_*) return 0;; *) return 1;; esac; }
+
+vf_start(){   # $1 model, $2 container name
+  local m=$1 name=$2 pp settings=() extra args
+  read -ra settings <<<"$VF_SETTINGS"
+  pp=$(image_pythonpath "$VF_IMAGE")
+  # Docker flags for serve.sh's DOCKER_EXTRA (split on whitespace): the script's label (--stop and --status find the container
+  # by it), the model folder read-only at /src, and the key-checking middleware every vLLM server here gets.
+  extra="--label spark-llm=1 -v $(mdir "$m" vllm-flash):/src:ro -v $BASE/vllm-auth:/opt/spark-llm-auth:ro -e VLLM_API_KEY -e PYTHONPATH=/opt/spark-llm-auth${pp:+:$pp}"
+  [[ "$BASE$(mdir "$m" vllm-flash)" != *[[:space:]]* ]] || die "vllm-flash: SPARK_LLM_HOME must not contain whitespace (serve.sh splits its Docker flags on it)"
+  # Every value is expanded here, before the environment is reduced below (CTX, PORT or BIND may have come from it).
+  # PORT is BIND:PORT because serve.sh publishes "-p $PORT:8000".
+  args=(env -C "$VF_DIR" IMAGE="$VF_IMAGE" NAME="$name" MODEL="$(vf_repo "$m")" HF_CACHE="$VF_HF" MODE="$VF_MODE"
+        PORT="$BIND:$PORT" CTX="$CTX" YARN=0 EFFORT_ALIAS=0 SERVED_MODEL_NAME="$(served "$m" vllm-flash)"
+        EXTRA="--middleware spark_llm_auth.RequireApiKey" DOCKER_EXTRA="$extra" "${settings[@]}" scripts/serve.sh)
+  say "Starting $(field "$m" vllm-flash 3) on vLLM v0.33 (blazux's recipe, MODE=$VF_MODE, ${CTX} ctx)"
+  ( local key="" v
+    if [ "$DRY" = 0 ]; then key=$(api_key); fi
+    for v in $(compgen -e); do vf_env_keep "$v" || unset "$v" 2>/dev/null || true; done
+    if [ "$DRY" = 0 ]; then VLLM_API_KEY=$key; export VLLM_API_KEY; fi
+    run "${args[@]}" )
+}
+vf_alive(){   # $1 container: running, or being restarted by its restart policy at most twice (the recipe: a first boot can need one)
+  local s; s=$(docker inspect --type container -f '{{.State.Status}} {{.RestartCount}}' "$1" 2>/dev/null) || return 1
+  case "${s%% *}" in running|restarting) [ "${s##* }" -le 2 ] ;; *) return 1 ;; esac
+}
+
 # ---------------------------------------------------------------- start / stop
 set_model_args(){   # $1 engine, $2 model -> MODEL_ARGS: the flags that depend on the model, not only on the engine
   case "$1:$2" in
@@ -913,7 +1139,7 @@ set_model_args(){   # $1 engine, $2 model -> MODEL_ARGS: the flags that depend o
       # OrcaRouter's separate MTP draft model, with the draft depth its model card recommends
       if [ "$LLAMA_ABL_MTP" = on ]; then
         MODEL_ARGS+=(-md "/models/$FN_ABL_DRAFT" -ngld 99 --spec-type draft-mtp --spec-draft-n-max 3); fi ;;
-    polystrata:*|strata:*|tensorfold:*) MODEL_ARGS=() ;;
+    polystrata:*|strata:*|tensorfold:*|velogb10:*|vllm-flash:*) MODEL_ARGS=() ;;
     *) die "no $1 settings for model '$2': add them to set_model_args" ;;
   esac
 }
@@ -951,6 +1177,17 @@ missing_for(){   # $1 model, $2 engine -> prints what a start needs but is not t
       [ -s "$(tf_model_path "$m")/config.json" ] || echo "weights ($(tf_model_path "$m"))"
       [ -x "$(tf_bin)" ] || echo "TensorFold $TF_VERSION"
       if needs_drafter "$m" tensorfold && [ ! -s "$(drafter_27b)/config.json" ]; then echo "DFlash2 drafter ($(drafter_27b))"; fi ;;
+    velogb10)
+      [ -s "$d/config.json" ] || echo "weights ($d)"
+      [ -x "$(vg_bin)" ] || echo "veloGB10 $VG_VERSION"
+      [ -s "$(vg_proxy)" ] || echo "auth-proxy.py (beside this script: $(vg_proxy))"
+      command -v python3 >/dev/null 2>&1 || echo "python3 (auth-proxy.py runs on it)" ;;
+    vllm-flash)
+      [ -s "$d/config.json" ] || echo "weights ($d)"
+      vf_ref_ok || echo "blazux's recipe at $VF_REF ($VF_DIR)"
+      vf_image_ok || echo "image $VF_IMAGE"
+      [ -s "$(vf_snap "$m")/config.json" ] || echo "the recipe's cache layout ($(vf_snap "$m"))"
+      [ -f "$(vf_hyb "$m")/.prepared" ] || echo "the fp8 side layers ($(vf_hyb "$m"))" ;;
     *) echo "engine '$e' (not wired into this script)" ;;
   esac
 }
@@ -962,6 +1199,12 @@ check_options(){   # $1 model, $2 engine: the switches of one row are on|off, an
   done
   if [ "$PS_REFUSAL_PROJECTION" = on ] && [ "$1:$2" != flashnext:polystrata ]; then
     die "PS_REFUSAL_PROJECTION=on is for flashnext on polystrata only (the projection was made for the stock model)"; fi
+  case "$VG_PREFIX_CACHE" in on|off) ;; *) die "VG_PREFIX_CACHE must be on or off, not '$VG_PREFIX_CACHE'" ;; esac
+  case "$VF_KV_DTYPE" in fp8_e4m3|auto) ;; *) die "VF_KV_DTYPE must be fp8_e4m3 (the default) or auto (bf16), not '$VF_KV_DTYPE'" ;; esac
+  [[ "$TF_PROMPT_CACHE_GIB" =~ ^[0-9]*$ ]] || die "TF_PROMPT_CACHE_GIB must be a whole number of GiB (0 = off), not '$TF_PROMPT_CACHE_GIB'"
+  if [ "$2" = velogb10 ]; then
+    [[ "$VG_PORT" =~ ^[0-9]+$ ]] && [ "$VG_PORT" != "$PORT" ] || die "VG_PORT must be a port number other than PORT ($PORT), not '$VG_PORT'"
+  fi
 }
 
 check_runnable(){   # $1 model, $2 engine: dies if a start could not work. Runs BEFORE the serving model is stopped.
@@ -993,7 +1236,7 @@ noauth_status(){   # $1 none|wrong, $2 URL, $3 JSON body -> HTTP status of a POS
 # vLLM, on /invocations). Other inference paths must refuse too, or not exist (404/405). Anything else: stop and die.
 auth_check(){   # $1 engine, $2 model, $3 base URL
   local e=$1 url=$3 body p a code must=(/v1/chat/completions) may=(/v1/completions /v1/responses /v1/messages /v1/embeddings /completion /completions) bad=()
-  if [ "$e" = vllm ]; then must+=(/invocations); else may+=(/invocations); fi
+  if [ "$e" = vllm ] || [ "$e" = vllm-flash ]; then must+=(/invocations); else may+=(/invocations); fi
   body=$(probe_body "$(served "$2" "$e")")
   for p in "${must[@]}" "${may[@]}"; do
     for a in none wrong; do
@@ -1021,7 +1264,12 @@ wait_ready(){   # $1 engine, $2 model, $3 container (docker engines)
       polystrata) native_alive "$PS_PID" "$PS_MARK" || { tail -40 "$BASE/logs/polystrata-server.log"; die "PolyStrata exited"; } ;;
       strata) native_alive "$ST_PID" "$ST_MARK" || { tail -40 "$BASE/logs/strata-server.log"; die "Strata exited"; } ;;
       tensorfold) native_alive "$TF_PID" "$TF_MARK" || { tail -40 "$BASE/logs/tensorfold-$m.log"; die "TensorFold exited"; } ;;
+      velogb10)   # either process gone: stop the other one too, so nothing is left holding the ports
+        native_alive "$VG_PID" "$VG_MARK" || { tail -40 "$BASE/logs/velogb10-$m.log"; vg_stop; die "veloGB10 exited"; }
+        native_alive "$VG_PROXY_PID" "$VG_PROXY_MARK" || { tail -20 "$BASE/logs/velogb10-proxy.log"; vg_stop; die "auth-proxy.py exited"; } ;;
       vllm|llamacpp) [ "$(docker inspect --type container -f '{{.State.Running}}' "$c" 2>/dev/null)" = true ] || { docker logs --tail 60 "$c" 2>&1 || true; die "container $c exited"; } ;;
+      # its restart policy would start it again: remove it
+      vllm-flash) vf_alive "$c" || { docker logs --tail 60 "$c" 2>&1 || true; docker rm -f "$c" >/dev/null 2>&1 || true; die "container $c exited (removed)"; } ;;
       *) die "engine '$e' is not wired into wait_ready" ;;
     esac
     # Listening first (the models list), then one real 1-token completion: a front-end server can list models
@@ -1054,6 +1302,7 @@ stop_all(){
   native_stop "$PS_PID" PolyStrata "$PS_MARK"
   native_stop "$ST_PID" Strata "$ST_MARK"
   native_stop "$TF_PID" TensorFold "$TF_MARK"
+  vg_stop
   [ "$DRY" = 1 ] || rm -f "$ACTIVE" "$ACTIVE_META"
   # the port must be free before the next start: a server still holding it would answer in the new one's place
   local t=0; while [ "$DRY" = 0 ] && ss -ltn "( sport = :$PORT )" | grep -q LISTEN; do
@@ -1103,12 +1352,18 @@ start_model(){   # $1 model, $2 engine (optional)
     [ -n "$CTX_ASKED" ] || CTX=$ST_CTX
     [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le "$ST_CTX" ] || die "CTX=$CTX: DeepSeek-V4.1-Flash reads at most $ST_CTX tokens"
   fi
+  if [ "$e" = velogb10 ]; then
+    [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le "$VG_MAX_CTX" ] || die "CTX=$CTX: veloGB10 serves at most $VG_MAX_CTX tokens of this model"
+  fi
+  if [ "$e" = vllm-flash ]; then
+    [[ "$CTX" =~ ^[0-9]+$ ]] && [ "$CTX" -le "$VF_MAX_CTX" ] || die "CTX=$CTX: vllm-flash serves at most the model's native $VF_MAX_CTX tokens"
+  fi
   if is_docker_engine "$e"; then need_docker; fi
   check_runnable "$m" "$e"   # before stop_all: a start that cannot work must not take down the model that is serving
   make_dirs
   if [ "$DRY" = 0 ]; then
     ensure_key
-    case "$e" in polystrata) cfg=$(ps_config "$m") ;; strata) cfg=$(st_config "$m") ;; vllm) vllm_auth_module ;; esac
+    case "$e" in polystrata) cfg=$(ps_config "$m") ;; strata) cfg=$(st_config "$m") ;; vllm|vllm-flash) vllm_auth_module ;; esac
   fi
   stop_all
   local name="llm-$m"
@@ -1118,10 +1373,13 @@ start_model(){   # $1 model, $2 engine (optional)
     polystrata) ps_start "$m" "$cfg" ;;
     strata) st_start "$m" "$cfg" ;;
     tensorfold) tf_start "$m" ;;
+    velogb10) vg_start "$m" ;;
+    vllm-flash) vf_start "$m" "$name" ;;
     *) die "engine '$e' is not wired into start_model" ;;
   esac
   [ "$DRY" = 1 ] && return
   wait_ready "$e" "$m" "$name"   # includes the auth check
+  if [ "$e" = velogb10 ]; then vg_check_ctx "$m"; fi
   write_active "$m" "$e" "$name"
 }
 
@@ -1146,8 +1404,15 @@ write_active(){   # $1 model, $2 engine, $3 container: .active ("model engine bi
                  "engine_version=$ST_ENGINE_VERSION" "engine_sha256=$ST_PKG_SHA256"
                  "gguf=$(st_files "$m" | awk 'NR == 1 {print $3}')" "shard4_sha256=$(st_files "$m" | awk 'END {print $1}')"
                  "engine_args=$(st_cfg_get "$ST_DIR/spark-llm-$m.json" args)" "engine_env=$(st_cfg_get "$ST_DIR/spark-llm-$m.json" env)") ;;
-    tensorfold) kv+=("tf_version=$TF_VERSION" "tf_sha256=$TF_SHA256" "extra=${TF_EXTRA:-}")
+    tensorfold) kv+=("tf_version=$TF_VERSION" "tf_sha256=$TF_SHA256" "extra=${TF_EXTRA:-}" "engine_env=$(tf_env "$m")"
+                     "prompt_cache_gib=$(tf_prompt_cache "$m")")
                 if needs_drafter "$m" tensorfold; then kv+=("drafter=$DRAFTER_27B_REPO"); fi ;;
+    vllm-flash) kv+=("image=$VF_IMAGE" "image_id=$(docker image inspect -f '{{.Id}}' "$VF_IMAGE" 2>/dev/null || true)"
+                     "recipe=$VF_REPO" "recipe_ref=$VF_REF" "recipe_head=$(git -C "$VF_DIR" rev-parse HEAD 2>/dev/null || true)"
+                     "base_image=$VF_BASE" "mode=$VF_MODE" "settings=$VF_SETTINGS" "prefix_caching=on (serve.sh PREFIX_CACHE=1)"
+                     "vllm_version=$(kcurl -fs --max-time 5 "http://$(probe_host "$BIND"):$PORT/version" 2>/dev/null || true)") ;;
+    velogb10) kv+=("vg_version=$VG_VERSION" "vg_sha256=$VG_SHA256" "prefix_cache=$VG_PREFIX_CACHE" "served_ctx=$(vg_served_ctx)"
+                   "engine_port=127.0.0.1:$VG_PORT" "proxy_sha256=$(sha256sum < "$(vg_proxy)" | cut -d' ' -f1)" "extra=${VG_EXTRA:-}") ;;
   esac
   python3 - "$ACTIVE_META" "${kv[@]}" <<'PY'
 import json, sys
@@ -1179,10 +1444,11 @@ status(){
     [ "$n" -gt 0 ] || echo "  none"
   else echo "  (docker is not installed)"; fi
   native_status "$PS_PID" PolyStrata "$PS_MARK"; native_status "$ST_PID" Strata "$ST_MARK"; native_status "$TF_PID" TensorFold "$TF_MARK"
+  native_status "$VG_PID" veloGB10 "$VG_MARK"; native_status "$VG_PROXY_PID" "veloGB10's key proxy" "$VG_PROXY_MARK"
   say "Active: $(cat "$ACTIVE" 2>/dev/null || echo none)"
   say "Memory"; free -g | sed -n 1,2p
   say "Disk"
-  local p paths=(); for p in "$BASE/models"/* "$PS_DIR" "$PS_DATA" "$ST_DIR" "$TF_DIR"; do [ -e "$p" ] && paths+=("$p"); done
+  local p paths=(); for p in "$BASE/models"/* "$PS_DIR" "$PS_DATA" "$ST_DIR" "$TF_DIR" "$VG_DIR" "$VF_DIR" "$VF_HF"; do [ -e "$p" ] && paths+=("$p"); done
   if [ ${#paths[@]} -gt 0 ]; then du -sh "${paths[@]}" 2>/dev/null || true; fi
   [ -n "$(compgen -G "$BASE/models/*")" ] || echo "  no models installed"
   echo "API key file: $KEYFILE"
@@ -1378,10 +1644,10 @@ cleanup(){
   if command -v docker >/dev/null 2>&1; then
     for c in $(docker ps -a --format '{{.Names}}' | grep -iE 'cybench|shared_net' || true); do run -q docker rm -f "$c" || true; done
     run -qq docker network rm shared_net || true
-    for i in "$VLLM_IMAGE" "$LLAMA_IMAGE" "$CYBENCH_IMAGE"; do run -qq docker rmi "$i" || true; done
+    for i in "$VLLM_IMAGE" "$VF_IMAGE" "$LLAMA_IMAGE" "$CYBENCH_IMAGE"; do run -qq docker rmi "$i" || true; done
   fi
   [ "$level" = containers ] && return
-  run rm -rf "$BASE/models" "$PS_DATA"
+  run rm -rf "$BASE/models" "$PS_DATA" "$VF_HF"
   [ "$level" = weights ] && return
   run rm -rf "$BASE"
   [ "$DRY" = 1 ] || say "Removed $BASE"
