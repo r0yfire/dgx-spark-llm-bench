@@ -1,0 +1,67 @@
+# Fixed Aider Polyglot subset: 60 exercises, 10 per language, the same list for every model compared.
+# Rule: for each language in Aider-AI/polyglot-benchmark at 7e0611e (the commit aider-polyglot.sh pins), sort the
+# exercise names, take random.Random("aider-subset-60/<language>").sample(names, 10) in Python 3 (string seeds are
+# deterministic across versions: 3.12 and 3.14 give this list), and sort the result. Every line matches exactly one
+# exercise path. Regenerate with:
+#   python3 -c 'import os,random,sys; r=sys.argv[1]; [print(f"{l}/exercises/practice/{n}") for l in sorted(os.listdir(r)) if os.path.isdir(f"{r}/{l}/exercises/practice") for n in sorted(random.Random(f"aider-subset-60/{l}").sample(sorted(os.listdir(f"{r}/{l}/exercises/practice")), 10))]' <polyglot-benchmark checkout>
+# Run it with: AIDER_SUBSET=aider-subset-60.txt ./aider-polyglot.sh --run
+cpp/exercises/practice/all-your-base
+cpp/exercises/practice/circular-buffer
+cpp/exercises/practice/complex-numbers
+cpp/exercises/practice/grade-school
+cpp/exercises/practice/kindergarten-garden
+cpp/exercises/practice/knapsack
+cpp/exercises/practice/linked-list
+cpp/exercises/practice/phone-number
+cpp/exercises/practice/queen-attack
+cpp/exercises/practice/sublist
+go/exercises/practice/bottle-song
+go/exercises/practice/dnd-character
+go/exercises/practice/food-chain
+go/exercises/practice/kindergarten-garden
+go/exercises/practice/pov
+go/exercises/practice/robot-simulator
+go/exercises/practice/scale-generator
+go/exercises/practice/transpose
+go/exercises/practice/tree-building
+go/exercises/practice/wordy
+java/exercises/practice/connect
+java/exercises/practice/dominoes
+java/exercises/practice/ocr-numbers
+java/exercises/practice/pig-latin
+java/exercises/practice/protein-translation
+java/exercises/practice/react
+java/exercises/practice/series
+java/exercises/practice/transpose
+java/exercises/practice/two-bucket
+java/exercises/practice/word-search
+javascript/exercises/practice/beer-song
+javascript/exercises/practice/bottle-song
+javascript/exercises/practice/complex-numbers
+javascript/exercises/practice/food-chain
+javascript/exercises/practice/forth
+javascript/exercises/practice/house
+javascript/exercises/practice/rectangles
+javascript/exercises/practice/space-age
+javascript/exercises/practice/variable-length-quantity
+javascript/exercises/practice/wordy
+python/exercises/practice/beer-song
+python/exercises/practice/bowling
+python/exercises/practice/food-chain
+python/exercises/practice/grep
+python/exercises/practice/phone-number
+python/exercises/practice/poker
+python/exercises/practice/sgf-parsing
+python/exercises/practice/tree-building
+python/exercises/practice/two-bucket
+python/exercises/practice/wordy
+rust/exercises/practice/accumulate
+rust/exercises/practice/book-store
+rust/exercises/practice/decimal
+rust/exercises/practice/grade-school
+rust/exercises/practice/luhn-from
+rust/exercises/practice/ocr-numbers
+rust/exercises/practice/parallel-letter-frequency
+rust/exercises/practice/variable-length-quantity
+rust/exercises/practice/word-count
+rust/exercises/practice/xorcism
